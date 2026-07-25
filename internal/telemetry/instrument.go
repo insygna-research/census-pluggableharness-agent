@@ -37,6 +37,23 @@ type Instruments struct {
 
 	ActiveSessions metric.Int64UpDownCounter
 
+	// SessionsStarted counts session starts, one per session
+	// (agent-loop.md §1/§7's session-start), root and sub-agent alike.
+	SessionsStarted metric.Int64Counter
+
+	// SessionsEnded counts session ends, one per session, by session.status
+	// (SessionStatusKey's bounded 7-value vocabulary) — the terminal
+	// SessionStatus a session's session_meta row was set to.
+	SessionsEnded metric.Int64Counter
+
+	// TokenCountFallbacks counts a CountTokens resolution
+	// (kernel-callbacks.md#counttokens) that fell back to the heuristic
+	// formula instead of an exact vendor count, by
+	// TokenCountFallbackReasonKey's bounded 4-value reason. Deliberately
+	// carries no provider-name attribute — see TokenCountFallbackReasonKey's
+	// doc comment.
+	TokenCountFallbacks metric.Int64Counter
+
 	EventBusEventsPublished     metric.Int64Counter
 	EventBusEventsDelivered     metric.Int64Counter
 	EventBusSubscriptionsActive metric.Int64UpDownCounter
@@ -53,12 +70,26 @@ type Instruments struct {
 	// a batch, not once per ExportSpans call.
 	RelayedSpans metric.Int64Counter
 
+	// InteractiveResolutions counts interactive-kind call resolutions
+	// through the internal/interactive seam
+	// (agent-loop/plan-apply-gate.md#data-source-and-interactive-calls),
+	// one per Resolve, by ToolNameKey and OutcomeKey — both bounded, so
+	// both are safe here. A build with no frontend attached refuses every
+	// one of them, which shows up as a pure OutcomeError series.
+	InteractiveResolutions metric.Int64Counter
+
 	// RecordMetricsAttributesDropped counts attribute keys dropped by
 	// RecordDynamicMetric's cardinality bound
 	// (observability.md#the-tracing-metrics-asymmetry) — incremented by
 	// however many keys a single observation dropped, not once per
 	// observation.
 	RecordMetricsAttributesDropped metric.Int64Counter
+
+	// ContextContributionViolations counts a context provider's
+	// contribution discarded by internal/contextassembly during a
+	// context-assemble firing, by ContextViolationReasonKey's bounded
+	// 3-value reason (scope, budget, non_text).
+	ContextContributionViolations metric.Int64Counter
 }
 
 // newInstruments registers every instrument against meter. An error here
@@ -134,6 +165,18 @@ func newInstruments(meter metric.Meter) (*Instruments, error) {
 		metric.WithDescription("Currently active sessions (root + sub-agent)."))
 	check("pluggableharness.sessions.active", err)
 
+	sessionsStarted, err := meter.Int64Counter("pluggableharness.sessions.started",
+		metric.WithDescription("Sessions started, root and sub-agent alike."))
+	check("pluggableharness.sessions.started", err)
+
+	sessionsEnded, err := meter.Int64Counter("pluggableharness.sessions.ended",
+		metric.WithDescription("Sessions ended, by session.status."))
+	check("pluggableharness.sessions.ended", err)
+
+	tokenCountFallbacks, err := meter.Int64Counter("pluggableharness.token_count.fallbacks",
+		metric.WithDescription("CountTokens resolutions that used the fallback heuristic instead of an exact vendor count, by fallback_reason."))
+	check("pluggableharness.token_count.fallbacks", err)
+
 	eventBusEventsPublished, err := meter.Int64Counter("pluggableharness.eventbus.events.published",
 		metric.WithDescription("internal/eventbus Publish calls that reached at least the fan-out step (topic is never an attribute here — see EventBusTopicKey's cardinality rule)."))
 	check("pluggableharness.eventbus.events.published", err)
@@ -154,9 +197,17 @@ func newInstruments(meter metric.Meter) (*Instruments, error) {
 		metric.WithDescription("Spans successfully relayed via ExportSpans, one per span."))
 	check("pluggableharness.telemetry.relayed_spans", err)
 
+	interactiveResolutions, err := meter.Int64Counter("pluggableharness.interactive.resolutions",
+		metric.WithDescription("Interactive-kind call resolutions, by tool.name and outcome."))
+	check("pluggableharness.interactive.resolutions", err)
+
 	recordMetricsAttributesDropped, err := meter.Int64Counter("pluggableharness.telemetry.record_metrics.attributes_dropped",
 		metric.WithDescription("Attribute keys dropped by RecordMetrics' per-instrument cardinality bound."))
 	check("pluggableharness.telemetry.record_metrics.attributes_dropped", err)
+
+	contextContributionViolations, err := meter.Int64Counter("pluggableharness.context.contribution.violations",
+		metric.WithDescription("Context provider contributions discarded during context-assemble, by violation_reason."))
+	check("pluggableharness.context.contribution.violations", err)
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
@@ -178,12 +229,18 @@ func newInstruments(meter metric.Meter) (*Instruments, error) {
 		HookDuration:    hookDuration,
 		ActiveSessions:  activeSessions,
 
+		SessionsStarted:     sessionsStarted,
+		SessionsEnded:       sessionsEnded,
+		TokenCountFallbacks: tokenCountFallbacks,
+
 		EventBusEventsPublished:     eventBusEventsPublished,
 		EventBusEventsDelivered:     eventBusEventsDelivered,
 		EventBusSubscriptionsActive: eventBusSubscriptionsActive,
 
 		EventBusSubscribeStreamsClosed: eventBusSubscribeStreamsClosed,
+		InteractiveResolutions:         interactiveResolutions,
 		RelayedSpans:                   relayedSpans,
 		RecordMetricsAttributesDropped: recordMetricsAttributesDropped,
+		ContextContributionViolations:  contextContributionViolations,
 	}, nil
 }

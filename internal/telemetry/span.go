@@ -13,19 +13,27 @@ import (
 
 // Span names for this package's instrumentation scope (pluggableharness-agent/kernel).
 const (
-	spanNameSession          = "session"
-	spanNameTurn             = "turn"
-	spanNameHookDispatch     = "hook.dispatch"
-	spanNameHookSubscriber   = "hook.subscriber"
-	spanNameModelCall        = "model.call"
-	spanNameToolExecute      = "tool.execute"
-	spanNamePolicyEvaluate   = "policy.evaluate"
-	spanNameRunSessionSpawn  = "session.spawn"
-	spanNameConfigLoad       = "config.load"
-	spanNameGlobalConfigLoad = "registry.global_config.load"
-	spanNameLockFileLoad     = "registry.lockfile.load"
-	spanNameChecksumVerify   = "registry.checksum.verify"
-	spanNamePluginLaunch     = "plugin.launch"
+	spanNameSession              = "session"
+	spanNameTurn                 = "turn"
+	spanNameHookDispatch         = "hook.dispatch"
+	spanNameHookSubscriber       = "hook.subscriber"
+	spanNameModelCall            = "model.call"
+	spanNameModelAttempt         = "model.attempt"
+	spanNameToolExecute          = "tool.execute"
+	spanNameToolPreview          = "tool.preview"
+	spanNamePolicyEvaluate       = "policy.evaluate"
+	spanNamePlanBuild            = "plan.build"
+	spanNamePlanApply            = "plan.apply"
+	spanNamePlanDecisionResolve  = "plan.decision.resolve"
+	spanNameInteractiveResolve   = "interactive.resolve"
+	spanNameRunSessionSpawn      = "session.spawn"
+	spanNameConfigLoad           = "config.load"
+	spanNameGlobalConfigLoad     = "registry.global_config.load"
+	spanNameLockFileLoad         = "registry.lockfile.load"
+	spanNameChecksumVerify       = "registry.checksum.verify"
+	spanNamePluginLaunch         = "plugin.launch"
+	spanNameProviderBringUp      = "pluginhost.provider.bringup"
+	spanNameProviderCatalogBuild = "providercatalog.build"
 
 	spanNameStateBackendSessionCreate   = "statebackend.session.create"
 	spanNameStateBackendSessionOpen     = "statebackend.session.open"
@@ -44,6 +52,8 @@ const (
 
 	spanNameEventBusPublish = "eventbus.publish"
 
+	spanNameKernelCallbackCountTokens        = "kernelcallback.count_tokens"
+	spanNameKernelCallbackEmit               = "kernelcallback.emit"
 	spanNameKernelCallbackExportSpans        = "kernelcallback.export_spans"
 	spanNameKernelCallbackRecordMetrics      = "kernelcallback.record_metrics"
 	spanNameKernelCallbackGetTelemetryConfig = "kernelcallback.get_telemetry_config"
@@ -52,6 +62,20 @@ const (
 	spanNameKernelCallbackSubscribe          = "kernelcallback.subscribe"
 	spanNameKernelCallbackReadEvents         = "kernelcallback.read_events"
 	spanNameKernelCallbackGetSession         = "kernelcallback.get_session"
+
+	spanNameSessionStateEmit        = "sessionstate.emit"
+	spanNameSessionStateEmitMessage = "sessionstate.emit_message"
+	spanNameSessionStateEmitPlan    = "sessionstate.emit_plan"
+
+	// spanNameContextAssemble and spanNameContextProviderContribute are
+	// deliberately their own names rather than reusing
+	// spanNameHookDispatch/spanNameHookSubscriber: context-assemble stays
+	// on ContextService.Contribute, not a hook.v1 dispatch
+	// (context/protocol.md#contribute-the-context-assemble-rpc,
+	// agent-loop/hook-dispatch.md#hook-points), and a trace reusing the
+	// hook-dispatch span name would wrongly imply it rode that mechanism.
+	spanNameContextAssemble           = "context.assemble"
+	spanNameContextProviderContribute = "context.provider.contribute"
 )
 
 // SessionSpan describes the session a StartSession call is opening
@@ -92,6 +116,30 @@ func (p *Provider) StartHookDispatch(ctx context.Context, point string) (context
 	return p.tracer.Start(ctx, spanNameHookDispatch, trace.WithAttributes(HookPointKey.String(point)))
 }
 
+// StartContextAssemble opens the span covering one context-assemble
+// firing's whole provider chain — step 1 of RunTurn
+// (agent-loop/turn-algorithm.md), the ContextService.Contribute chain
+// across every loaded context provider in agent.hcl declaration order
+// (context/protocol.md#contribute-the-context-assemble-rpc). A provider's
+// own Contribute call, instrumented via StartContextProviderContribute
+// using the ctx this returns, nests as a child of this span. This is
+// deliberately NOT StartHookDispatch under a borrowed point name —
+// context-assemble is not a hook.v1 dispatch (see spanNameContextAssemble's
+// doc comment) — so internal/contextassembly gets its own pair of Start*
+// helpers here rather than reusing the hook-dispatch ones.
+func (p *Provider) StartContextAssemble(ctx context.Context, turnID string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNameContextAssemble, trace.WithAttributes(TurnIDKey.String(turnID)))
+}
+
+// StartContextProviderContribute opens the span covering one context
+// provider's Contribute RPC call within a context-assemble firing, nested
+// inside the ctx StartContextAssemble returns. producer identifies the
+// contributing provider.
+func (p *Provider) StartContextProviderContribute(ctx context.Context, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := producerAttributes(producer)
+	return p.tracer.Start(ctx, spanNameContextProviderContribute, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+}
+
 // StartHookSubscriber opens the span covering one subscriber's invocation
 // within a hook dispatch (agent-loop.md §4). producer may be nil for a
 // kernel-internal subscriber (e.g. the policy engine's plan-ready veto).
@@ -112,6 +160,18 @@ func (p *Provider) StartModelCall(ctx context.Context, modelID string, producer 
 	return p.tracer.Start(ctx, spanNameModelCall, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 }
 
+// StartModelAttempt opens the span covering one retry attempt within a
+// model call's overall span — nested inside the ctx StartModelCall
+// returns. attempt is a small bounded int (configuration/settings-and-global.md's
+// max_retries default is 5) — safe as a span attribute.
+func (p *Provider) StartModelAttempt(ctx context.Context, modelID string, producer *commonv1.ProducerRef, attempt int) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{
+		ModelIDKey.String(modelID),
+		AttemptKey.Int(attempt),
+	}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameModelAttempt, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+}
+
 // StartToolExecute opens the span covering one resolved tool call's
 // execution (steps 9/9b/12 of agent-loop.md §2).
 func (p *Provider) StartToolExecute(ctx context.Context, toolName, toolKind string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
@@ -122,11 +182,68 @@ func (p *Provider) StartToolExecute(ctx context.Context, toolName, toolKind stri
 	return p.tracer.Start(ctx, spanNameToolExecute, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 }
 
+// StartToolPreview opens the span covering one Preview RPC call
+// (tool/protocol.md#preview). Two call sites use this, both a real
+// Preview invocation on the wire: plan construction's dry-run
+// description populated on a resource PlanItem
+// (agent-loop/plan-apply-gate.md#preview-flow), and
+// providercatalog/drivers/plugin's one-time, catalog-build-time probe
+// that resolves ToolHandle.SupportsPreview (see that package's doc.go).
+func (p *Provider) StartToolPreview(ctx context.Context, toolName string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{ToolNameKey.String(toolName)}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameToolPreview, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+}
+
+// StartProviderCatalogBuild opens the span covering one
+// providercatalog/drivers/plugin.New call: extracting every model spec,
+// tool schema, context capability, and hook subscription out of a
+// pluginhost.Registry's already-live plugins, including the one-time
+// Preview probes StartToolPreview covers as child spans. One-time,
+// startup-time cost — never on a turn's hot path.
+func (p *Provider) StartProviderCatalogBuild(ctx context.Context) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNameProviderCatalogBuild)
+}
+
 // StartPolicyEvaluate opens the span covering plan/policy evaluation — the
 // plan-ready hook's veto chain plus any tool-call prechecks
 // (agent-loop.md §5.1).
 func (p *Provider) StartPolicyEvaluate(ctx context.Context) (context.Context, trace.Span) {
 	return p.tracer.Start(ctx, spanNamePolicyEvaluate)
+}
+
+// StartPlanBuild opens the span covering one turn's plan construction —
+// build_plan(resource_calls), step 10 of turn-algorithm.md's RunTurn
+// algorithm. turnID is unbounded (TurnIDKey's doc comment) — span
+// attribute only.
+func (p *Provider) StartPlanBuild(ctx context.Context, turnID string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNamePlanBuild, trace.WithAttributes(TurnIDKey.String(turnID)))
+}
+
+// StartPlanApply opens the span covering applying one turn's approved
+// plan — apply_approved_items(plan), step 12 of turn-algorithm.md's
+// RunTurn algorithm. turnID is unbounded (TurnIDKey's doc comment) — span
+// attribute only.
+func (p *Provider) StartPlanApply(ctx context.Context, turnID string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNamePlanApply, trace.WithAttributes(TurnIDKey.String(turnID)))
+}
+
+// StartPlanDecisionResolve opens the span covering resolving one
+// ask-decision plan item via the plan-decision resolver seam
+// (agent-loop/plan-apply-gate.md#decision-semantics's ask handling,
+// frontend/frontend-protocol.md's ClientEvent.PlanDecision). planItemID is
+// unbounded (PlanItemIDKey's doc comment) — span attribute only.
+func (p *Provider) StartPlanDecisionResolve(ctx context.Context, planItemID string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNamePlanDecisionResolve, trace.WithAttributes(PlanItemIDKey.String(planItemID)))
+}
+
+// StartInteractiveResolve opens the span covering resolving one
+// interactive-kind call via the interactive resolver seam
+// (agent-loop/plan-apply-gate.md#data-source-and-interactive-calls,
+// frontend/frontend-protocol.md's interactive_request/interactive_response
+// pair). toolName is bounded by the operator's configured tool set
+// (ToolNameKey's doc comment), so it's safe here same as StartToolExecute.
+func (p *Provider) StartInteractiveResolve(ctx context.Context, toolName string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNameInteractiveResolve, trace.WithAttributes(ToolNameKey.String(toolName)))
 }
 
 // StartRunSessionSpawn opens the span covering a RunSession callback that
@@ -174,6 +291,25 @@ func (p *Provider) StartPluginLaunch(ctx context.Context, category, name, versio
 		ProducerCategoryKey.String(category),
 		ProducerNameKey.String(name),
 		ProducerVersionKey.String(version),
+	))
+}
+
+// StartProviderBringUp opens the span covering one declared provider's
+// whole bring-up sequence — subprocess launch, Describe, checksum
+// verification, capability/schema fetch, config decode, and Configure —
+// for use by internal/pluginhost.Supervisor.Start. It is the parent of
+// the StartPluginLaunch span internal/pluginruntime.Launch opens for the
+// subprocess spawn alone, which covers only the first of those steps.
+//
+// localName is the agent.hcl required_providers local name, the only
+// identity available before the plugin has answered Describe; category
+// is the lock file's cached record of the category, empty when unknown
+// (a dev-override provider, whose category is discovered by probing).
+// Ended via EndSpan by the caller.
+func (p *Provider) StartProviderBringUp(ctx context.Context, localName, category string) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNameProviderBringUp, trace.WithAttributes(
+		ProviderLocalNameKey.String(localName),
+		ProducerCategoryKey.String(category),
 	))
 }
 
@@ -295,6 +431,23 @@ func (p *Provider) StartEventBusPublish(ctx context.Context, topic string) (cont
 	return p.tracer.Start(ctx, spanNameEventBusPublish, trace.WithAttributes(EventBusTopicKey.String(topic)))
 }
 
+// StartKernelCallbackCountTokens opens the span covering one CountTokens
+// call (kernel-callbacks.md's CountTokens) — plugin-scoped, so, unlike
+// StartKernelCallbackReadEvents/GetSession, it carries no session_id
+// (kernel-callbacks.md's "The callback channel" plugin-scoped-vs-session-scoped
+// split).
+func (p *Provider) StartKernelCallbackCountTokens(ctx context.Context, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	return p.tracer.Start(ctx, spanNameKernelCallbackCountTokens, trace.WithAttributes(producerAttributes(producer)...))
+}
+
+// StartKernelCallbackEmit opens the span covering one Emit call
+// (kernel-callbacks.md's Emit) — the RPC through which a plugin persists an
+// event into the calling session's state backend.
+func (p *Provider) StartKernelCallbackEmit(ctx context.Context, sessionID string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{SessionIDKey.String(sessionID)}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameKernelCallbackEmit, trace.WithAttributes(attrs...))
+}
+
 // StartKernelCallbackExportSpans opens the span covering one ExportSpans
 // call (kernel-callbacks.md's ExportSpans) — the relay-bridge handler's
 // own span, distinct from any span carried inside the relayed batch
@@ -351,6 +504,35 @@ func (p *Provider) StartKernelCallbackReadEvents(ctx context.Context, sessionID 
 func (p *Provider) StartKernelCallbackGetSession(ctx context.Context, sessionID string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
 	attrs := append([]attribute.KeyValue{SessionIDKey.String(sessionID)}, producerAttributes(producer)...)
 	return p.tracer.Start(ctx, spanNameKernelCallbackGetSession, trace.WithAttributes(attrs...))
+}
+
+// StartSessionStateEmit opens the span covering one internal/sessionstate
+// Live.Emit call — the sole-writer session append (state-backend.md#ordering--concurrency)
+// plus its kernel.event.{kind} republish (kernel-callbacks.md#emit) —
+// distinct from StartKernelCallbackEmit, which covers the RPC handler one
+// layer up, and from the StartStateBackend*/StartEventBusPublish spans
+// this call nests, which cover the underlying append and bus fan-out.
+func (p *Provider) StartSessionStateEmit(ctx context.Context, sessionID string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{SessionIDKey.String(sessionID)}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameSessionStateEmit, trace.WithAttributes(attrs...))
+}
+
+// StartSessionStateEmitMessage opens the span covering one
+// internal/sessionstate Live.EmitMessage call — the kernel-internal path
+// that additionally writes a cost_ledger row and debits the session's
+// (and every ancestor's) budget tracker in the same call.
+func (p *Provider) StartSessionStateEmitMessage(ctx context.Context, sessionID string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{SessionIDKey.String(sessionID)}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameSessionStateEmitMessage, trace.WithAttributes(attrs...))
+}
+
+// StartSessionStateEmitPlan opens the span covering one
+// internal/sessionstate Live.EmitPlan call — the kernel-internal path that
+// additionally writes plan_items rows, using statebackend.KernelProducer()
+// as its producer (state-backend.md#the-kind-enum).
+func (p *Provider) StartSessionStateEmitPlan(ctx context.Context, sessionID string, producer *commonv1.ProducerRef) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{SessionIDKey.String(sessionID)}, producerAttributes(producer)...)
+	return p.tracer.Start(ctx, spanNameSessionStateEmitPlan, trace.WithAttributes(attrs...))
 }
 
 // EndSpan ends span, recording err onto it first if non-nil (RecordError
