@@ -32,7 +32,7 @@ CREATE TABLE events (
   id                TEXT NOT NULL UNIQUE,   -- stable event identifier, independent of storage
   timestamp         TEXT NOT NULL,          -- wall-clock, display only, not ordering-authoritative
   kind              TEXT NOT NULL,          -- see "The kind enum" below for the authoritative enum
-  producer_category TEXT NOT NULL,          -- model | tool | context | memory | frontend | widget
+  producer_category TEXT NOT NULL,          -- model | tool | context | memory | frontend | widget | slashcommand
   producer_name     TEXT NOT NULL,
   producer_version  TEXT NOT NULL,
   schema_version    TEXT NOT NULL,
@@ -156,7 +156,7 @@ kind = enum {
 }
 ```
 
-Each `kind` above decodes to exactly one concrete message in `pluggableharness.event.v1` (`api/pluggableharness/event/v1/event.proto`) — that package defines no enum of its own; this table, together with `kernel-callbacks.md#emit`'s restatement of the same enum, is the sole source of the kind → message mapping:
+Each `kind` above decodes to exactly one concrete message in `pluggableharness.event.v1` (`api/pluggableharness/event/v1/events.proto`) — that package defines no enum of its own; this table, together with `kernel-callbacks.md#emit`'s restatement of the same enum, is the sole source of the kind → message mapping:
 
 | `kind` | `event.v1` message |
 |---|---|

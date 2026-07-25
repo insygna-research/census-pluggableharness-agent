@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	otellog "go.opentelemetry.io/otel/log"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 	"go.opentelemetry.io/otel/metric"
@@ -47,6 +48,24 @@ type Backend interface {
 	// log/slog output (internal/CLAUDE.md), into this backend.
 	LogExporter(ctx context.Context) (sdklog.Exporter, error)
 
+	// TraceUploader returns an already-started otlptrace.Client for
+	// relaying a plugin's own already-completed spans
+	// (specifications/observability.md#the-relay-model) to this backend's
+	// collector, bypassing the SDK's TracerProvider/span-creation pipeline
+	// entirely — a relayed span already has its own trace_id/span_id/
+	// timestamps from the plugin's own SDK, and re-creating it through
+	// this process's own tracer would silently reassign those, severing
+	// it from the parent/child relationships it already had. Unlike
+	// TraceExporter (which telemetry.New wraps in a
+	// sdktrace.TracerProvider this process starts and stops), the
+	// returned Client is not currently owned by Provider — the caller
+	// that requests it (internal/telemetryrelay) is responsible for
+	// calling Client.Stop when it's done, mirroring what
+	// otlptrace.Exporter would normally do internally. TraceUploader
+	// itself calls Client.Start before returning, so the returned Client
+	// is immediately ready for UploadTraces.
+	TraceUploader(ctx context.Context) (otlptrace.Client, error)
+
 	// Name identifies the driver, for error messages and diagnostics.
 	Name() string
 }
@@ -56,6 +75,8 @@ type Backend interface {
 // plugin's pkg/telemetry.Bootstrap) constructs via New and tears down via
 // Shutdown.
 type Provider struct {
+	cfg Config
+
 	tp *sdktrace.TracerProvider
 	mp *sdkmetric.MeterProvider
 	lp *sdklog.LoggerProvider
@@ -70,8 +91,9 @@ type Provider struct {
 	meterProvider  metric.MeterProvider
 	loggerProvider otellog.LoggerProvider
 
-	tracer      trace.Tracer
-	instruments *Instruments
+	tracer         trace.Tracer
+	instruments    *Instruments
+	dynamicMetrics *dynamicMetrics
 
 	shutdownOnce sync.Once
 	shutdownErr  error
@@ -99,7 +121,7 @@ func New(ctx context.Context, cfg Config, backend Backend, producer *commonv1.Pr
 		return nil, fmt.Errorf("telemetry: new: %w", err)
 	}
 
-	p := &Provider{}
+	p := &Provider{cfg: cfg}
 
 	if cfg.TracesEnabled {
 		exporter, err := backend.TraceExporter(ctx)
@@ -151,6 +173,7 @@ func New(ctx context.Context, cfg Config, backend Backend, producer *commonv1.Pr
 		return nil, fmt.Errorf("telemetry: new: instruments: %w", err)
 	}
 	p.instruments = instruments
+	p.dynamicMetrics = newDynamicMetrics(p.meterProvider.Meter(meterName))
 
 	return p, nil
 }
@@ -219,4 +242,13 @@ func (p *Provider) Tracer() trace.Tracer {
 // Instruments returns the pre-constructed metric instruments.
 func (p *Provider) Instruments() *Instruments {
 	return p.instruments
+}
+
+// Config returns the Config this Provider was constructed with — used by
+// internal/kernelcallback's GetTelemetryConfig handler to answer whether
+// tracing/metrics/logs are enabled and at what sampling ratio
+// (kernel-callbacks.md's GetTelemetryConfig), without threading a second
+// copy of the same configuration through kernelcallback.Config.
+func (p *Provider) Config() Config {
+	return p.cfg
 }

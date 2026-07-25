@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package pluggableharness.slashcommand.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "pluggableharness/common/v1/types.proto";
+import "pluggableharness/schema/v1/types.proto";
+import "pluggableharness/tool/v1/types.proto";
+
+option go_package = "github.com/pluggableharness/agent/pkg/slashcommand/proto/v1;slashcommandv1";
+
+// Domain types for the slashcommand provider protocol. The
+// prompt-expansion vocabulary every other category's capability
+// response embeds directly lives in common.v1.PromptExpansionSpec
+// instead, not here — it has no dependency on this package's own
+// types (kind/risk/concurrency/schema), and homing it in common.v1
+// keeps that package's embedders from needing an edge into this one.
+
+// SlashCommandSpec declares one directly-invocable command this
+// provider exposes — a tool-shaped operation in its own right, invoked
+// via this same provider's own SlashCommandService.Invoke, never by
+// naming another provider's tool operation. kind/risk/concurrency are
+// pluggableharness.tool.v1 types, reused verbatim: a direct-invoke
+// command flows through the identical plan/apply gate a tool call does
+// (pluggableharness.plan.v1.PlanItem), so it needs the identical
+// classification vocabulary, not a parallel copy of it.
+message SlashCommandSpec {
+  // The command's name, without the leading "/". MUST be unique across
+  // every direct-invoke command declared by every provider in the
+  // session — a name collision at config-load time is a hard error
+  // (configuration.md §5).
+  string name = 1;
+
+  // Shown in the frontend's hotkey_hints region and wherever else the
+  // frontend surfaces available commands.
+  string description = 2;
+
+  // MUST — the common JSON-Schema subset per model.md §6, describing
+  // the shape of SlashCommandCall.arguments for this command.
+  pluggableharness.schema.v1.Schema input_schema = 3;
+
+  // MUST — drives the plan/apply gate, identically to
+  // pluggableharness.tool.v1.ToolSchema.kind.
+  pluggableharness.tool.v1.ToolKind kind = 4;
+
+  // MUST — see pluggableharness.tool.v1.RiskClass.
+  pluggableharness.tool.v1.RiskClass risk = 5;
+
+  // MUST, except MUST NOT be meaningfully set for TOOL_KIND_INTERACTIVE.
+  pluggableharness.tool.v1.ConcurrencySpec concurrency = 6;
+
+  // MUST — true if Invoke may emit intermediate SlashCommandEvents
+  // (output_chunk, progress, partial_result) before the terminal event;
+  // false if Invoke always emits exactly one terminal event with no
+  // lead-up.
+  bool streaming = 7;
+
+  // SHOULD — the deadline the kernel applies to Invoke for this command
+  // absent an agent.hcl override. Absent means the kernel's global
+  // default applies instead (configuration/settings-and-global.md).
+  optional google.protobuf.Duration default_timeout = 8;
+
+  // True iff re-running this command with identical arguments cannot
+  // produce a different end state than running it once. Gates whether
+  // the kernel MAY auto-retry a retryable
+  // pluggableharness.tool.v1.ToolError for a TOOL_KIND_RESOURCE command
+  // — see tool/conformance.md#error-taxonomy's retry interaction, reused
+  // verbatim.
+  bool idempotent = 9;
+
+  // No output_schema: unlike a tool operation, a direct-invoke command
+  // is never presented to the model as a callable tool — it dispatches
+  // without a model turn — so there is no LLM-facing structured-output
+  // contract to validate its result against.
+}
+
+// SlashCommandCall is one request to execute a direct-invoke command,
+// structurally identical to pluggableharness.tool.v1.ToolCall.
+message SlashCommandCall {
+  // MUST — kernel-assigned. Echoed in every SlashCommandEvent for this
+  // call, for correlation.
+  string id = 1;
+
+  // MUST — matches a SlashCommandSpec.name from this provider's
+  // GetCapabilities response.
+  string name = 2;
+
+  // MUST — already-parsed JSON conforming to that SlashCommandSpec's
+  // input_schema.
+  google.protobuf.Struct arguments = 3;
+
+  // MUST be set by the kernel. Carries the session_id/turn_id this call
+  // executes for and the session's working_directory, identically to
+  // pluggableharness.tool.v1.ToolCall.call_context.
+  pluggableharness.common.v1.CallContext call_context = 4;
+}

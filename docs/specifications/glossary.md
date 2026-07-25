@@ -4,8 +4,8 @@ Terminology used throughout `docs/specifications/`.
 
 | Term | Meaning |
 |---|---|
-| **Provider** | A plugin binary implementing one of the six categories: model, tool, memory, context, frontend, widget. |
-| **Category** | One of the six provider kinds above, each with its own protocol (`model/`, `tool/`, `memory/`, `context/`, `frontend/` — widget is documented alongside frontend). |
+| **Provider** | A plugin binary implementing one of the seven categories: model, tool, memory, context, frontend, widget, slashcommand. |
+| **Category** | One of the seven provider kinds above, each with its own protocol (`model/`, `tool/`, `memory/`, `context/`, `frontend/` — widget is documented alongside frontend — `slashcommand/`). |
 | **Resource** | A tool operation that **mutates** state — gated behind the plan/apply flow. See [`agent-loop/plan-apply-gate.md`](agent-loop/plan-apply-gate.md). |
 | **Data source** | A tool operation that only **reads** — executes freely (subject to a policy precheck, not a plan/apply gate), feeds the plan. |
 | **Interactive** | A tool kind for calls that neither read nor write state but require a human response mid-turn (e.g. `ask_user`). See [`tool/protocol.md`](tool/protocol.md#kind-interactive) and [`agent-loop/plan-apply-gate.md`](agent-loop/plan-apply-gate.md). |
@@ -30,3 +30,7 @@ Terminology used throughout `docs/specifications/`.
 | **Schema-to-cty bridge** | The mechanism translating a provider's declared config schema into an `hcldec` spec so `agent.hcl` provider blocks decode through real HCL2/`cty`, distinct from the JSON-Schema subset tool authors use for LLM function-calling. See [`configuration/blocks-reference.md`](configuration/blocks-reference.md). |
 | **Canonical message** | The kernel's internal content-block message representation (`text`, `tool_use`, `tool_result`, `image`, `thinking`, `redacted_thinking`) — the state backend's source of truth, independent of any one vendor's wire format. See [`model/data-types.md`](model/data-types.md). |
 | **Lock file** | `.agent/agent.lock.hcl` — pins resolved provider version, source, and checksum per provider, mirroring `.terraform.lock.hcl`. See [`configuration/lock-file.md`](configuration/lock-file.md). |
+| **Event bus** | The ephemeral, best-effort, cross-plugin publish/subscribe primitive behind `Publish`/`Subscribe` — distinct from `Emit` (durable), hook dispatch (synchronous, `agent.hcl`-declared), and frontend broadcast (connection-scoped). See [`event-bus.md`](event-bus.md). |
+| **Topic** | A dot-separated string identifying an event-bus channel — `plugin.{category}.{name}.{event_type}` for a plugin-published event, `kernel.*` reserved for the kernel. See [`event-bus.md#topic-grammar`](event-bus.md#topic-grammar). |
+| **Publish** / **Subscribe** | The kernel callback primitives that put an event onto the bus and receive a live stream of events matching a topic filter, respectively. See [`kernel-callbacks.md`](kernel-callbacks.md) and [`event-bus.md`](event-bus.md). |
+| **Telemetry relay** | A plugin's own trace spans and metric observations reaching the operator's configured collector via the kernel (`ExportSpans`/`RecordMetrics`), rather than each plugin process exporting OTLP directly. See [`observability.md`](observability.md). |
