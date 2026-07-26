@@ -312,6 +312,18 @@ type fakeTools struct {
 
 	// failCalls names call ids whose outcome carries a ToolError.
 	failCalls map[string]bool
+	// crashTripCalls names call ids whose outcome carries the
+	// process_crashed ToolError a tripped circuit breaker produces —
+	// internal/tooldispatch stamps the trip into Error.Details rather than
+	// onto Outcome itself, so this fake reproduces that exact shape.
+	crashTripCalls map[string]bool
+	// mislabeledTripCalls names call ids whose outcome carries the
+	// BreakerTrippedDetail key on a category that is NOT process_crashed.
+	// internal/tooldispatch never produces this shape today — recordBreaker
+	// stamps the key only under its crashed branch — so this exists purely
+	// to prove the reader's category guard is load-bearing rather than
+	// decorative, and would catch a future writer widening the key's use.
+	mislabeledTripCalls map[string]bool
 	// errExecute fails the whole Execute batch.
 	errExecute error
 	// shortOutcomes drops the last outcome, to exercise the
@@ -348,6 +360,36 @@ func (f *fakeTools) outcomes(calls []tooldispatch.Call) ([]tooldispatch.Outcome,
 	}
 	out := make([]tooldispatch.Outcome, 0, len(calls))
 	for _, c := range calls {
+		if f.crashTripCalls[c.Call.GetId()] {
+			out = append(out, tooldispatch.Outcome{
+				Call: c.Call,
+				Error: &toolv1.ToolError{
+					Category:  toolv1.ToolErrorCategory_TOOL_ERROR_CATEGORY_PROCESS_CRASHED,
+					Message:   c.Call.GetToolName() + " crashed",
+					Retryable: true,
+					Details: mustStruct(map[string]any{
+						tooldispatch.BreakerTrippedDetail:  true,
+						tooldispatch.BreakerProviderDetail: c.Handle.Provider,
+					}),
+				},
+			})
+			continue
+		}
+		if f.mislabeledTripCalls[c.Call.GetId()] {
+			out = append(out, tooldispatch.Outcome{
+				Call: c.Call,
+				Error: &toolv1.ToolError{
+					Category:  toolv1.ToolErrorCategory_TOOL_ERROR_CATEGORY_TIMEOUT,
+					Message:   c.Call.GetToolName() + " timed out",
+					Retryable: true,
+					Details: mustStruct(map[string]any{
+						tooldispatch.BreakerTrippedDetail:  true,
+						tooldispatch.BreakerProviderDetail: c.Handle.Provider,
+					}),
+				},
+			})
+			continue
+		}
 		if f.failCalls[c.Call.GetId()] {
 			out = append(out, tooldispatch.Outcome{
 				Call: c.Call,

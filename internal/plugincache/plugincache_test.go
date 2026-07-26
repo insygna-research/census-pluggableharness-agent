@@ -285,3 +285,86 @@ func TestExists(t *testing.T) {
 		}
 	})
 }
+
+// TestBinaryPath_everyComponentStaysInsideCacheDir pins that no
+// caller-supplied component can make the resolved path escape cacheDir.
+// source was sanitized from the start; version and platform were not, even
+// though both are equally caller-supplied (they come from a lock-file row)
+// and filepath.Join resolves ".." rather than treating it as a literal
+// directory name.
+func TestBinaryPath_everyComponentStaysInsideCacheDir(t *testing.T) {
+	t.Parallel()
+
+	const cacheDir = "/cache"
+
+	tests := []struct {
+		name     string
+		source   string
+		version  string
+		platform string
+	}{
+		{"traversal in version", "github.com/agentco/p", "../../../tmp/evil", "linux_amd64"},
+		{"traversal in platform", "github.com/agentco/p", "1.2.3", "../../.."},
+		{"traversal in source", "../../../tmp/evil", "1.2.3", "linux_amd64"},
+		{"bare dotdot version", "github.com/agentco/p", "..", "linux_amd64"},
+		{"bare dot version", "github.com/agentco/p", ".", "linux_amd64"},
+		{"backslash in version", "github.com/agentco/p", `..\..\evil`, "linux_amd64"},
+		// A colon cannot escape cacheDir — Windows' filepath.Join appends
+		// to its first element and Clean never strips a leading prefix —
+		// but it does suppress the separator after the element it ends
+		// (Join(`C:`, `f`) == `C:f`), gluing two components into one, and
+		// on NTFS it names an Alternate Data Stream rather than a
+		// directory entry. Both are covered by neutralizing it.
+		{"drive prefix in version", "github.com/agentco/p", "C:", "linux_amd64"},
+		{"drive prefix in platform", "github.com/agentco/p", "1.2.3", `C:\windows`},
+		{"drive prefix in source", "C:", "1.2.3", "linux_amd64"},
+		{"colon inside version", "github.com/agentco/p", "1.0:stream", "linux_amd64"},
+		{"dotdot source yields dotdot binary name", "..", "1.2.3", "linux_amd64"},
+		{"dot source yields dot binary name", ".", "1.2.3", "linux_amd64"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := BinaryPath(cacheDir, tt.source, tt.version, tt.platform)
+
+			// Containment is checked via filepath.Rel, not a string prefix
+			// against cacheDir: filepath.Join normalizes separators, so on
+			// Windows a "/cache" argument comes back as "\cache\..." and a
+			// literal prefix comparison fails on the separator rather than
+			// on the property under test. Rel is the separator-agnostic
+			// idiom — an escape shows up as a relative path that starts by
+			// walking back out.
+			rel, err := filepath.Rel(cacheDir, got)
+			if err != nil {
+				t.Fatalf("filepath.Rel(%q, %q): %v", cacheDir, got, err)
+			}
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				t.Fatalf("BinaryPath = %q escapes cacheDir %q (relative path %q)", got, cacheDir, rel)
+			}
+			// A ".." SUBSTRING is harmless — ".._.._tmp" is an ordinary
+			// literal directory name. What must not survive is a path
+			// COMPONENT that is exactly "." or "..", since those are the
+			// only two filepath resolves rather than treats as a name.
+			for component := range strings.SplitSeq(got, string(filepath.Separator)) {
+				if component == "." || component == ".." {
+					t.Errorf("BinaryPath = %q contains an unescaped %q component", got, component)
+				}
+			}
+		})
+	}
+}
+
+// TestBinaryPath_wellFormedInputIsUnchanged guards the other side: the
+// sanitization must be a no-op for every realistic input, so no existing
+// cached binary's path moves.
+func TestBinaryPath_wellFormedInputIsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	got := BinaryPath("/cache", "github.com/agentco/provider-anthropic", "1.2.3", "linux_amd64")
+	want := filepath.Join("/cache", "github.com_agentco_provider-anthropic", "1.2.3", "linux_amd64", "provider-anthropic")
+	if got != want {
+		t.Errorf("BinaryPath = %q, want %q", got, want)
+	}
+}
