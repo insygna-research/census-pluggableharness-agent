@@ -206,8 +206,31 @@ type StreamCompletionRequest struct {
 	// natural stable-prefix boundaries — see
 	// model/protocol.md#cache-breakpoint-placement-policy.
 	CacheBreakpoints []*CacheBreakpoint `protobuf:"bytes,7,rep,name=cache_breakpoints,json=cacheBreakpoints,proto3" json:"cache_breakpoints,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Vendor-specific request knobs the kernel has no semantics for, passed
+	// through untouched: the kernel never reads a key, validates one, or
+	// assigns meaning to one. This is the escape hatch that lets a
+	// third-party provider ship a vendor feature — a service tier, a
+	// sampling seed, a beta-feature flag, a conversation-retention id —
+	// without a change to this protocol. Values originate in the provider's
+	// own ConfigSchema and the operator's provider{} block, and the provider
+	// documents its own accepted keys; two providers MAY use the same key
+	// name for unrelated things.
+	//
+	// A Struct for the same reason ConfigureRequest.config is one — the
+	// shape is the provider's schema, not the kernel's to name — applied
+	// per-request rather than once at configure time (.claude/rules/proto.md's
+	// Struct precedent list).
+	//
+	// MUST NOT carry anything the kernel reads. Pass-through is the whole
+	// contract, so a value affecting routing, capability validation, cost
+	// computation, or replay is a typed field on this protocol or it does
+	// not work at all — a provider smuggling one through here gets silence,
+	// not kernel behavior. Promoting such a knob to a typed field in a later
+	// revision is the fix; teaching the kernel to read this field is not.
+	// See model/data-types.md#provider_options.
+	ProviderOptions *structpb.Struct `protobuf:"bytes,8,opt,name=provider_options,json=providerOptions,proto3,oneof" json:"provider_options,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StreamCompletionRequest) Reset() {
@@ -289,16 +312,45 @@ func (x *StreamCompletionRequest) GetCacheBreakpoints() []*CacheBreakpoint {
 	return nil
 }
 
-// CountTokensRequest is CountTokens' request: the raw text to count, per
-// model.md §2.1.
+func (x *StreamCompletionRequest) GetProviderOptions() *structpb.Struct {
+	if x != nil {
+		return x.ProviderOptions
+	}
+	return nil
+}
+
+// CountTokensRequest is CountTokens' request: the request whose input
+// tokens are being counted, per model/protocol.md#counttokens.
+//
+// This mirrors StreamCompletionRequest's content-bearing fields, minus
+// everything that only affects generation, because every vendor exposing
+// exact counting counts a whole request rather than a string — Anthropic's
+// /v1/messages/count_tokens takes messages plus system plus tools. An
+// earlier revision carried a flat `text` field; concatenating text and
+// discarding the rest undercounts by the entire tool-schema and
+// system-preamble weight, which is exactly the weight that decides whether
+// a turn fits in the context window.
 type CountTokensRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The text to count tokens for.
-	Text string `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
 	// Selects which of this provider's ModelSpec.id to count against — a
 	// provider serving several models MAY have distinct tokenizers per
 	// model. MUST be set.
-	ModelId       string `protobuf:"bytes,2,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
+	ModelId string `protobuf:"bytes,2,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
+	// The conversation to count, in emission order. MAY be empty. A caller
+	// with only loose content to measure (a context provider sizing its own
+	// contribution, kernel-callbacks.md#counttokens) passes it as a single
+	// user message — which is what the adapter would have had to construct
+	// anyway.
+	Messages []*v1.Message `protobuf:"bytes,3,rep,name=messages,proto3" json:"messages,omitempty"`
+	// The kernel-assembled context chain that would accompany these
+	// messages, counted against the same vendor mechanism
+	// StreamCompletionRequest.assembled_context maps to. MAY be empty.
+	AssembledContext []*v1.ContextSection `protobuf:"bytes,4,rep,name=assembled_context,json=assembledContext,proto3" json:"assembled_context,omitempty"`
+	// The tool declarations that would accompany these messages. MAY be
+	// empty. Tool schemas are frequently the largest single contributor to
+	// a request's input tokens, so omitting them is the main way a count
+	// goes badly wrong.
+	Tools         []*ToolDeclaration `protobuf:"bytes,5,rep,name=tools,proto3" json:"tools,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -333,18 +385,32 @@ func (*CountTokensRequest) Descriptor() ([]byte, []int) {
 	return file_pluggableharness_model_v1_rpc_request_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *CountTokensRequest) GetText() string {
-	if x != nil {
-		return x.Text
-	}
-	return ""
-}
-
 func (x *CountTokensRequest) GetModelId() string {
 	if x != nil {
 		return x.ModelId
 	}
 	return ""
+}
+
+func (x *CountTokensRequest) GetMessages() []*v1.Message {
+	if x != nil {
+		return x.Messages
+	}
+	return nil
+}
+
+func (x *CountTokensRequest) GetAssembledContext() []*v1.ContextSection {
+	if x != nil {
+		return x.AssembledContext
+	}
+	return nil
+}
+
+func (x *CountTokensRequest) GetTools() []*ToolDeclaration {
+	if x != nil {
+		return x.Tools
+	}
+	return nil
 }
 
 // RenderRequest carries the opaque payload to render, per model.md §7.
@@ -417,7 +483,7 @@ const file_pluggableharness_model_v1_rpc_request_proto_rawDesc = "" +
 	"\x16GetCapabilitiesRequest\"C\n" +
 	"\x10ConfigureRequest\x12/\n" +
 	"\x06config\x18\x01 \x01(\v2\x17.google.protobuf.StructR\x06config\"\x11\n" +
-	"\x0fDescribeRequest\"\x8c\x04\n" +
+	"\x0fDescribeRequest\"\xea\x04\n" +
 	"\x17StreamCompletionRequest\x12@\n" +
 	"\bmessages\x18\x01 \x03(\v2$.pluggableharness.content.v1.MessageR\bmessages\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12@\n" +
@@ -425,11 +491,15 @@ const file_pluggableharness_model_v1_rpc_request_proto_rawDesc = "" +
 	"\x06params\x18\x04 \x01(\v2+.pluggableharness.model.v1.GenerationParamsH\x00R\x06params\x88\x01\x01\x12X\n" +
 	"\x11assembled_context\x18\x05 \x03(\v2+.pluggableharness.content.v1.ContextSectionR\x10assembledContext\x12J\n" +
 	"\fcall_context\x18\x06 \x01(\v2'.pluggableharness.common.v1.CallContextR\vcallContext\x12W\n" +
-	"\x11cache_breakpoints\x18\a \x03(\v2*.pluggableharness.model.v1.CacheBreakpointR\x10cacheBreakpointsB\t\n" +
-	"\a_params\"C\n" +
-	"\x12CountTokensRequest\x12\x12\n" +
-	"\x04text\x18\x01 \x01(\tR\x04text\x12\x19\n" +
-	"\bmodel_id\x18\x02 \x01(\tR\amodelId\"P\n" +
+	"\x11cache_breakpoints\x18\a \x03(\v2*.pluggableharness.model.v1.CacheBreakpointR\x10cacheBreakpoints\x12G\n" +
+	"\x10provider_options\x18\b \x01(\v2\x17.google.protobuf.StructH\x01R\x0fproviderOptions\x88\x01\x01B\t\n" +
+	"\a_paramsB\x13\n" +
+	"\x11_provider_options\"\x99\x02\n" +
+	"\x12CountTokensRequest\x12\x19\n" +
+	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12@\n" +
+	"\bmessages\x18\x03 \x03(\v2$.pluggableharness.content.v1.MessageR\bmessages\x12X\n" +
+	"\x11assembled_context\x18\x04 \x03(\v2+.pluggableharness.content.v1.ContextSectionR\x10assembledContext\x12@\n" +
+	"\x05tools\x18\x05 \x03(\v2*.pluggableharness.model.v1.ToolDeclarationR\x05toolsJ\x04\b\x01\x10\x02R\x04text\"P\n" +
 	"\rRenderRequest\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\x12%\n" +
 	"\x0eschema_version\x18\x02 \x01(\tR\rschemaVersionB>Z<github.com/pluggableharness/agent/pkg/model/proto/v1;modelv1b\x06proto3"
@@ -470,11 +540,15 @@ var file_pluggableharness_model_v1_rpc_request_proto_depIdxs = []int32{
 	10, // 4: pluggableharness.model.v1.StreamCompletionRequest.assembled_context:type_name -> pluggableharness.content.v1.ContextSection
 	11, // 5: pluggableharness.model.v1.StreamCompletionRequest.call_context:type_name -> pluggableharness.common.v1.CallContext
 	12, // 6: pluggableharness.model.v1.StreamCompletionRequest.cache_breakpoints:type_name -> pluggableharness.model.v1.CacheBreakpoint
-	7,  // [7:7] is the sub-list for method output_type
-	7,  // [7:7] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	6,  // 7: pluggableharness.model.v1.StreamCompletionRequest.provider_options:type_name -> google.protobuf.Struct
+	7,  // 8: pluggableharness.model.v1.CountTokensRequest.messages:type_name -> pluggableharness.content.v1.Message
+	10, // 9: pluggableharness.model.v1.CountTokensRequest.assembled_context:type_name -> pluggableharness.content.v1.ContextSection
+	8,  // 10: pluggableharness.model.v1.CountTokensRequest.tools:type_name -> pluggableharness.model.v1.ToolDeclaration
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_pluggableharness_model_v1_rpc_request_proto_init() }

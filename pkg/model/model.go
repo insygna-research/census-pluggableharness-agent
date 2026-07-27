@@ -61,12 +61,21 @@ type Provider interface {
 // io.ReaderFrom) rather than adding a boolean capability flag a Provider
 // must remember to keep in sync with its own method set.
 type TokenCounter interface {
-	// CountTokens returns an exact token count for text against modelID's
+	// CountTokens returns an exact input-token count for req against the
 	// real vendor tokenizer, per
-	// docs/specifications/model/protocol.md#counttokens. modelID MUST be
-	// honored — a provider serving several models MAY use a distinct
-	// tokenizer per model.
-	CountTokens(ctx context.Context, text, modelID string) (int64, error)
+	// docs/specifications/model/protocol.md#counttokens.
+	//
+	// req names a whole request — messages, assembled context, and tool
+	// declarations — not a string, because that is what every vendor's
+	// counting endpoint actually measures, and because tool schemas are
+	// frequently the largest single contributor to a request's input
+	// tokens. req.ModelId MUST be honored: a provider serving several
+	// models MAY use a distinct tokenizer per model.
+	//
+	// Takes the generated request type directly, for the same reason
+	// StreamCompletion does (see this package's doc.go): it is already the
+	// canonical shape, and mirroring it would be a purely duplicative copy.
+	CountTokens(ctx context.Context, req *modelv1.CountTokensRequest) (int64, error)
 }
 
 // Renderer is the optional interface behind Render
@@ -131,8 +140,8 @@ type Spec struct {
 	// accurately; false means the kernel serializes tool calls for this
 	// model.
 	SupportsParallelToolCalls bool
-	// Thinking is this model's extended-reasoning capability. Use
-	// ThinkingSpec{} (Mode left at THINKING_MODE_NONE) when unsupported.
+	// Thinking is this model's extended-reasoning capability. Use the zero
+	// ThinkingSpec{} when unsupported.
 	Thinking ThinkingSpec
 	// Caching is this model's prompt-caching capability. Use
 	// CachingSpec{} (Mode left at CACHING_MODE_NONE) when unsupported.
@@ -151,32 +160,66 @@ type Spec struct {
 
 // ThinkingSpec describes one model's extended-reasoning capability, per
 // docs/specifications/model/data-types.md#thinkingspec.
+//
+// These are independent axes, not one-of-N modes. A model may reason
+// adaptively AND expose an effort ladder, or accept an effort level AND a
+// deprecated token budget. Declare every control the model actually
+// accepts; the kernel validates each requested parameter against the
+// specific control that governs it.
 type ThinkingSpec struct {
 	// Supported reports whether this model has any extended-reasoning
-	// capability at all.
+	// capability at all. When false, Effort and Budget MUST both be nil,
+	// AdaptiveByDefault MUST be false, and Disable MUST be
+	// THINKING_DISABLE_SUPPORT_NEVER.
 	Supported bool
-	// Mode is which reasoning-control shape this model uses. MUST be
-	// THINKING_MODE_NONE when Supported is false.
-	Mode modelv1.ThinkingMode
-	// EffortLevels are the selectable effort levels, e.g. ["low","medium",
-	// "high","xhigh","max"]. MUST be non-empty when
-	// Mode == THINKING_MODE_DISCRETE_EFFORT.
-	EffortLevels []string
-	// BudgetRange is the selectable token-budget range. MUST be present
-	// when Mode == THINKING_MODE_CONTINUOUS_BUDGET.
-	BudgetRange *ThinkingBudgetRange
-	// CanDisable reports whether reasoning can be turned off once
-	// enabled. Some vendors' reasoning cannot be disabled.
-	CanDisable bool
-	// Default is the effort level (discrete_effort) or budget-token value
-	// (continuous_budget), as a string, the vendor applies when a request
-	// omits thinking config entirely. MUST be non-empty when
-	// Mode != THINKING_MODE_NONE.
+	// Effort is the named-effort-level control, non-nil iff this model
+	// accepts one. Nil means sending a thinking effort to this model is a
+	// kernel-level reject rather than something forwarded to the vendor.
+	Effort *EffortControl
+	// Budget is the explicit-token-budget control, non-nil iff this model
+	// accepts one. A model that never had one, and a model whose vendor
+	// removed it, both leave this nil.
+	Budget *BudgetControl
+	// AdaptiveByDefault reports whether omitting every thinking control
+	// still produces reasoning. False means an unconfigured request
+	// reasons zero tokens.
+	AdaptiveByDefault bool
+	// Disable reports whether, and when, reasoning can be turned off. MUST
+	// be set when Supported is true.
+	Disable modelv1.ThinkingDisableSupport
+}
+
+// EffortControl declares that a model accepts a named reasoning-effort
+// level, and which levels.
+type EffortControl struct {
+	// Levels are the selectable effort levels, e.g. ["low","medium",
+	// "high","xhigh","max"]. MUST be non-empty — a model with no
+	// selectable levels leaves ThinkingSpec.Effort nil instead.
+	Levels []string
+	// Default is the level the vendor applies when a request omits effort
+	// entirely. MUST be non-empty and MUST appear in Levels.
 	Default string
 }
 
-// ThinkingBudgetRange bounds the token budget a caller may request when
-// ThinkingSpec.Mode is THINKING_MODE_CONTINUOUS_BUDGET.
+// BudgetControl declares that a model accepts an explicit reasoning-token
+// budget, and its bounds.
+type BudgetControl struct {
+	// Range is the accepted token-budget range, inclusive on both bounds.
+	Range ThinkingBudgetRange
+	// Default is the budget the vendor applies when a request omits one.
+	// Nil means the vendor reasons zero tokens by default — a pointer
+	// because a declared budget of 0 and an undeclared default are
+	// different statements.
+	Default *int64
+	// Deprecated reports that the vendor still honors this control but
+	// steers callers to effort/adaptive instead, and may remove it in a
+	// later model. A vendor that has already removed it is declared by
+	// leaving ThinkingSpec.Budget nil, not by setting this.
+	Deprecated bool
+}
+
+// ThinkingBudgetRange bounds the token budget a caller may request on a
+// model declaring a BudgetControl. Both bounds are inclusive.
 type ThinkingBudgetRange struct {
 	// Min is the smallest thinking-token budget this model accepts.
 	Min int64
@@ -186,13 +229,27 @@ type ThinkingBudgetRange struct {
 
 // CachingSpec describes one model's prompt-caching capability, per
 // docs/specifications/model/data-types.md#cachingspec.
+//
+// ExplicitMarkers and ImplicitAutomatic are independent axes, not
+// alternatives: a model may run automatic caching by default and still
+// accept explicit breakpoints at a deeper discount. Declare both when
+// both are true.
 type CachingSpec struct {
 	// Supported reports whether this model has any prompt-caching
-	// capability at all.
+	// capability at all. When false, both axes below MUST be false; when
+	// true, at least one MUST be true.
 	Supported bool
-	// Mode is which caching mechanic this model uses. MUST be
-	// CACHING_MODE_NONE when Supported is false.
-	Mode modelv1.CachingMode
+	// ExplicitMarkers reports whether the caller may place cache
+	// breakpoints that this adapter translates into vendor-native markers.
+	// This is the axis StreamCompletionRequest.cache_breakpoints is gated
+	// on — an adapter for a model without it MUST ignore that field rather
+	// than error on it.
+	ExplicitMarkers bool
+	// ImplicitAutomatic reports whether the vendor caches transparently
+	// above some token threshold with no caller action. Declaring it
+	// requires nothing of the kernel; it exists so cache-hit and cost
+	// behavior are explicable.
+	ImplicitAutomatic bool
 	// KeepaliveSupported reports whether this provider runs its own
 	// cache-keepalive loop. MUST be set (default false); cache TTL
 	// mechanics are vendor-specific and provider-owned, never a kernel
@@ -278,4 +335,25 @@ type Usage struct {
 	// reports them as a distinct count. Never also counted in
 	// OutputTokens; billed at PricingTier.OutputPerMtok.
 	ReasoningTokens *int64
+	// RateLimits is the vendor's own rate-limit state as of this
+	// completion. MAY be empty; a Provider MUST NOT synthesize a snapshot
+	// from its own bookkeeping — only report what the vendor published.
+	RateLimits []RateLimitSnapshot
+}
+
+// RateLimitSnapshot is one of the vendor's rate-limit budgets as of one
+// completion, per docs/specifications/model/data-types.md#usagerate_limits.
+//
+// Every field but Kind is a pointer because vendors publish different
+// subsets, and "the vendor did not say" is meaningfully different from
+// "the vendor said zero" — the second means the budget is exhausted.
+type RateLimitSnapshot struct {
+	// Kind names which budget this describes. MUST be set.
+	Kind modelv1.RateLimitKind
+	// Remaining is how much of this budget is left.
+	Remaining *int64
+	// Limit is this budget's ceiling for the current window.
+	Limit *int64
+	// ResetAt is when this budget next resets.
+	ResetAt *time.Time
 }

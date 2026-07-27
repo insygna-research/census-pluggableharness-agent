@@ -23,40 +23,73 @@ ModelSpec {
 }
 ```
 
-Rationale for the sum-type shape of `ThinkingSpec`/`CachingSpec` below: all three thinking modes and both caching modes are in active use across real vendors, sometimes multiple modes on different models *from the same vendor* (Anthropic's newer models use adaptive thinking; Haiku 4.5 only supports the older discrete `budget_tokens` style). A boolean `supports_thinking` flag would lose information the kernel actually needs to build a correct request.
+Rationale for the shape of `ThinkingSpec`/`CachingSpec` below: a boolean `supports_thinking`/`supports_caching` flag would lose information the kernel actually needs to build a correct request, because real vendors differ in *how* the capability is controlled, not only in whether it exists — sometimes across models from the same vendor.
+
+**Both are sets of independent axes, not one-of-N modes.** This is the correction to an earlier design that modeled each as a single mutually-exclusive enum. Real models occupy more than one position at once, and a single-valued enum forces a provider to declare a half-truth:
+
+- A model MAY reason adaptively *and* expose a named effort ladder simultaneously. Anthropic's Opus 4.8 and Sonnet 5 are exactly this — omitting thinking config runs adaptive reasoning, and `output_config.effort` selects a level on top of it. An adapter for such a model sends both controls in one request.
+- A model MAY accept a named effort level *and* an explicit token budget, with the budget deprecated but still functional. Anthropic's Opus 4.6 and Sonnet 4.6 are this; Haiku 4.5 accepts only the budget and errors on effort; Opus 4.7 and later reject the budget with a 400. The status is per-model, never per-vendor, and a spec shape that cannot say so pushes the distinction into adapter code where no caller can see it.
+- Whether reasoning can be turned off is not always a yes or no. Anthropic's Opus 5 accepts an explicit disable at effort `high` or below and rejects it at `xhigh` or `max` — so both `true` and `false` are wrong, and the honest answer needs a third value.
+
+Each axis below is therefore declared on its own. A model declares every control it actually accepts, and the kernel validates a requested parameter against the specific control that governs it rather than against a mode that stands in for a whole model family.
 
 ### `ThinkingSpec`
 
 ```protobuf
 ThinkingSpec {
-  supported bool
-  mode      enum { none, always_on_adaptive, discrete_effort, continuous_budget }
-  effort_levels   []string   // required if mode == discrete_effort, e.g. ["low","medium","high","xhigh","max"]
-  budget_range    {min, max} // required if mode == continuous_budget (token count range)
-  can_disable     bool       // MUST — some vendors' reasoning cannot be turned off (e.g. a
-                              // Grok model defaulting reasoning on with no off switch)
-  default         string?    // MUST when mode != none — the effort level (discrete_effort)
-                              // or budget-token value (continuous_budget, as a string) the
-                              // vendor applies when a request omits thinking config entirely.
-                              // Makes the actual default behavior visible/auditable in
-                              // GetCapabilities instead of hidden in adapter code — a kernel
-                              // wanting deterministic behavior can read this and always send
-                              // an explicit override rather than guessing what "unspecified"
-                              // means for a given model.
+  supported bool                    // MUST — whether this model reasons at all
+  effort    EffortControl?          // present iff the model accepts a named effort level
+  budget    BudgetControl?          // present iff the model accepts an explicit token budget
+  adaptive_by_default bool          // MUST — whether omitting every thinking control still reasons
+  disable   enum { unspecified, never, always, conditional }  // MUST when supported
+}
+
+EffortControl {
+  levels  []string   // MUST be non-empty, e.g. ["low","medium","high","xhigh","max"]
+  default string     // MUST — the level the vendor applies when a request omits effort
+}
+
+BudgetControl {
+  range      {min, max}  // MUST — the accepted token-budget range, inclusive
+  default    int64?      // MAY — the budget the vendor applies when a request omits one;
+                          // omitted means the vendor reasons zero tokens by default
+  deprecated bool        // MUST — the vendor still honors this control but steers callers
+                          // to effort/adaptive instead, and MAY remove it in a later model
 }
 ```
+
+`supported == false` means the model has no reasoning capability: `effort` and `budget` MUST both be absent and `adaptive_by_default` MUST be false. `disable` is meaningless in that case — there is nothing to disable — so both `unspecified` and `never` are accepted and mean the same thing, and a reader MUST treat them identically. This keeps the all-zero `ThinkingSpec` a valid declaration for a model that does not reason, which is the common case; only a positive claim that reasoning *can* be turned off (`always` or `conditional`) contradicts `supported == false` and MUST be rejected. Every other combination is a real, declarable position:
+
+| Axis | Meaning when present/true |
+|---|---|
+| `effort` | The caller MAY select one of `levels`. Absent means this model has no effort ladder — sending an effort level is a kernel-level reject, not something forwarded. |
+| `budget` | The caller MAY select a token budget inside `range`. Absent means this model has no budget control; a model that once had one and had it removed declares it absent, not `deprecated`. |
+| `adaptive_by_default` | Omitting both controls still produces reasoning. False means an unconfigured request reasons zero tokens. This is what makes the vendor's actual default behavior auditable through `GetCapabilities` rather than hidden in adapter code — a kernel wanting deterministic behavior reads it and sends an explicit override instead of guessing what "unspecified" means. |
+| `disable = never` | Reasoning cannot be turned off at all (a Grok model defaulting reasoning on with no off switch; Anthropic's Fable 5, where an explicit disable is a 400). |
+| `disable = always` | An explicit disable is accepted in every configuration. |
+| `disable = conditional` | An explicit disable is accepted in some configurations and rejected in others — Anthropic's Opus 5 accepts it at effort `high` or below and returns a 400 at `xhigh` or `max`. The protocol deliberately does not model *which* configurations: the condition is vendor-specific and would need a general constraint language to express. What `conditional` buys the kernel is the knowledge that a disable attempt MAY legitimately fail, so such a failure is a vendor policy response and not an adapter bug. |
+
+`EffortControl.default` and `BudgetControl.default` replace a single `default` string that had to encode either kind of value. Each now sits on the control it belongs to, in that control's own type, which also settles the question of what a per-model budget default means separately from the range's bounds.
 
 ### `CachingSpec`
 
 ```protobuf
 CachingSpec {
-  supported bool
-  mode      enum { none, explicit_markers, implicit_automatic }
-  // explicit_markers: caller must place cache breakpoints on content blocks (Anthropic/Mistral-style)
-  // implicit_automatic: vendor applies caching transparently above a token threshold, no caller action
-  keepalive_supported  bool  // MUST, default false — see the keepalive note below
+  supported            bool   // MUST — whether this model caches prompts at all
+  explicit_markers     bool   // MUST — the caller MAY place cache breakpoints on content blocks
+  implicit_automatic   bool   // MUST — the vendor caches transparently above a token threshold
+  keepalive_supported  bool   // MUST, default false — see the keepalive note below
 }
 ```
+
+Like [`ThinkingSpec`](#thinkingspec), these are independent axes rather than one-of-N modes, and for the same reason: a real model occupies both positions at once. Google's Gemini 2.5 and later run implicit automatic caching by default *and* offer explicit manual declaration concurrently, at a deeper discount. An enum could name only one, which forced an adapter either to under-declare the model or to route the second mechanism outside this protocol entirely.
+
+`supported == false` means the model does not cache: `explicit_markers` and `implicit_automatic` MUST both be false. `supported == true` requires at least one of them to be true — a model that caches by some mechanism the protocol cannot name is not declarable, and silently declaring neither would read as "no caching" to every caller.
+
+| Axis | Meaning when true |
+|---|---|
+| `explicit_markers` | The caller places cache breakpoints and the adapter translates them into vendor-native markers (Anthropic's `cache_control`, Mistral's `prompt_cache_key`). This is the axis [`cache_breakpoints`](#cache_breakpoints-and-cache-breakpoint-placement-policy) is gated on. |
+| `implicit_automatic` | The vendor caches transparently above some token threshold with no caller action. Declaring this does not require the kernel to do anything; it exists so cost and cache-hit behavior are explicable rather than surprising. |
 
 **Cache keepalive is a provider-owned behavior, not a kernel mechanism.** A dedicated keepalive daemon — re-pinging every 5 minutes so a long tool-execution gap doesn't let a prompt-cache TTL expire — is a real-world pattern (as used, for example, by Aider) and a real cost concern given `cache_read_per_mtok` (below) is typically far cheaper than `input_per_mtok`. This is deliberately **not** a kernel-loop responsibility: cache TTL mechanics are vendor-specific (5m/1h TTLs differ per vendor), and the adapter that already understands its own vendor's `CachingSpec.mode` is the natural owner of keeping that cache warm — not a kernel that would need to learn every vendor's TTL semantics to orchestrate a generic loop. A model provider MAY implement its own internal keepalive (e.g. a background goroutine within the plugin subprocess watching elapsed time since the last real call) and declares this via `keepalive_supported` so the kernel/operator can tell whether a given provider implements the optimization, without the kernel ever driving the loop itself.
 
@@ -107,6 +140,7 @@ The full shape of what `StreamCompletion` streams back — see [`protocol.md#str
 
 ```protobuf
 StreamEvent = oneof {
+  stream_start         { provider_request_id: string }  // MAY — see below
   text_delta          { text: string }
   thinking_delta       { text: string }                    // only when ThinkingSpec.supported
   thinking_signature   { signature: bytes }                // see "Canonical message" below —
@@ -119,7 +153,7 @@ StreamEvent = oneof {
   tool_call_start      { id: string, name: string }
   tool_call_delta       { id: string, arguments_fragment: string }  // partial-JSON accumulation
   tool_call_done        { id: string }
-  usage                 { input_tokens, output_tokens, cache_read_tokens?, cache_write_tokens?, reasoning_tokens? }
+  usage                 { input_tokens, output_tokens, cache_read_tokens?, cache_write_tokens?, reasoning_tokens?, rate_limits[] }
   stop                   { reason: StopReason, matched_stop_sequence?: string }
   error                  ModelError                        // see conformance.md#error-taxonomy
 }
@@ -143,6 +177,18 @@ StopReason = enum {
 ```
 
 `usage.reasoning_tokens` is set only when the vendor reports thinking/reasoning tokens as a distinct count (`ThinkingSpec.supported` models only) and is never also counted in `output_tokens` — a vendor that folds reasoning tokens into its reported `output_tokens` has no separate figure to report, so this stays unset rather than being derived or subtracted. It's billed at `PricingTier.output_per_mtok` unless a future `Pricing` revision declares a distinct reasoning rate; there is none as of this revision.
+
+### `stream_start` and vendor request correlation
+
+`stream_start` carries the vendor's own identifier for this request — an Anthropic `request-id` header, an OpenAI `x-request-id` — as soon as the adapter learns it, normally from response headers before any content streams. It exists so a failure can be correlated with the vendor's own logs when asking them what went wrong. A plugin whose vendor publishes no such id MAY omit the event entirely.
+
+It is a separate early event rather than a field on `stop` deliberately: an id that arrives only on successful completion is absent in exactly the case it is needed. The kernel treats the value as opaque — logged and surfaced, never parsed.
+
+### `usage.rate_limits`
+
+`rate_limits` reports the vendor's own rate-limit budgets as of this completion. It MAY be empty; a vendor that publishes nothing has nothing to declare, and an adapter MUST NOT synthesize a snapshot from its own bookkeeping.
+
+It is repeated because vendors publish several budgets at once and they exhaust independently — OpenAI and xAI return separate request and token headers, Anthropic reports input and output separately. Naming *which* budget is close to empty is the entire value: "you have 2% left" is unactionable without saying 2% of what, and a user whose session stops mid-task without being told which ceiling they hit cannot act on it. Every numeric field on a snapshot is optional, so an adapter reports the subset its vendor actually returned rather than inventing the rest.
 
 A plugin MUST classify every terminal failure via a `stop` event's `content_filtered` reason or an `error` event carrying a `ModelError` ([`conformance.md#error-taxonomy`](conformance.md#error-taxonomy)) — the in-band `error` variant is how a plugin reports a classified failure *within* an otherwise-open stream, distinct from the stream simply being torn down at the transport level (a gRPC-level status, or the kernel closing the stream on cancellation). A plugin whose backend fails outright before producing any events MAY end the stream with just an `error` event and no preceding `stop`.
 
@@ -190,6 +236,7 @@ StreamCompletionRequest {
   assembled_context     []ContextSection     // MUST — the kernel-assembled context chain, see below
   call_context           CallContext          // MUST — session/turn/working-directory attribution, see below
   cache_breakpoints     []CacheBreakpoint     // MAY be empty — see below
+  provider_options       Struct?              // MAY — vendor-specific pass-through, see below
 }
 ```
 
@@ -219,9 +266,21 @@ CacheBreakpoint {
 }
 ```
 
-`cache_breakpoints` is meaningful only when the target model's `CachingSpec.mode == CACHING_MODE_EXPLICIT_MARKERS`; a model-provider adapter targeting a model whose `CachingSpec.mode` is `CACHING_MODE_IMPLICIT_AUTOMATIC` or `CACHING_MODE_NONE` MUST ignore this field rather than error on it. The adapter maps each breakpoint to its vendor's own cache-control mechanism (e.g. an Anthropic `cache_control` block on the targeted content).
+`cache_breakpoints` is meaningful only when the target model declares `CachingSpec.explicit_markers`; an adapter targeting a model that does not MUST ignore this field rather than error on it. The adapter maps each breakpoint to its vendor's own cache-control mechanism (e.g. an Anthropic `cache_control` block on the targeted content).
+
+Gating on `explicit_markers` alone — rather than on a mode that could name only one mechanism — is what lets a model declaring *both* caching axes still honor breakpoints. Under the earlier enum, a model like Gemini 2.5 that declared implicit caching (the accurate description of its default behavior) was thereby required to discard breakpoints it could in fact have honored through its explicit pathway.
 
 **Breakpoint placement is a kernel decision, not the plugin's.** The kernel knows each `assembled_context` section's `Stability` (`content/v1/types.proto`'s `Stability` enum: `STABILITY_STATIC` vs. `STABILITY_DYNAMIC`) and each message's position in the conversation, so it places breakpoints at natural stable-prefix boundaries — the same tools → system → static-project-context → conversation-tail ordering that governs `assembled_context`'s own chain order. In practice this means: a breakpoint after `after_tools` when the tool declaration list is stable turn to turn, and a breakpoint after `after_assembled_context` when the whole chain's leading sections are `STABILITY_STATIC` — since that's usually the longest stable prefix a vendor's prompt cache can actually reuse. A plugin never invents its own placement; it only translates the breakpoints the kernel already decided into vendor-native markers.
+
+### `provider_options`
+
+`provider_options` is an optional `google.protobuf.Struct` carrying vendor-specific request knobs the kernel has no semantics for. It is the escape hatch that lets a third-party provider ship a vendor feature without a change to this protocol — a vendor's `service_tier`, a sampling `seed`, a beta-feature header flag, a conversation-retention id, an incremental-response id. The kernel passes it through untouched: it never reads a key, never validates one, and never assigns meaning to one.
+
+Values originate the same way every other provider-specific value does — from the provider's own `ConfigSchema` and the operator's `provider "<name>" { ... }` block ([`configuration/blocks-reference.md`](../configuration/blocks-reference.md)) — and the provider documents its own accepted keys. Two providers MAY use the same key name for unrelated things; nothing in this protocol coordinates them.
+
+**The rule that keeps this honest: a field the kernel reads MUST NOT live here.** `provider_options` is pass-through by construction, so anything the kernel acts on — a value affecting routing, capability validation, cost computation, or replay — is a typed field on this protocol or it does not work at all. A provider that smuggles such a value through `provider_options` gets no kernel behavior from it, only silence. Concretely: prompt-cache TTL selection cannot live here (the kernel computes `cost_usd` and the TTL changes the rate), a thinking-effort level cannot live here (the kernel validates it against [`ThinkingSpec`](#thinkingspec) and routes fallbacks on it), and a token count cannot live here. When a knob turns out to need kernel behavior, the fix is to promote it to a typed field in a later protocol revision — not to teach the kernel to read `provider_options`.
+
+This is a `Struct` for the same reason `ConfigureRequest.config` is one — the shape is the provider's schema, not the kernel's to name — applied per-request rather than once at configure time. It is deliberately *not* one of the opaque `bytes` payloads (Emit→Render→Paint, event-bus publish), which exist so a producer's payload format can evolve independently of the kernel; `provider_options` exists because the kernel has no opinion about the values at all. See the repository's protobuf rule (`.claude/rules/proto.md`)'s strong-typing section, whose pass-through rule this section restates from the protocol side.
 
 ## `GenerationParams`
 
@@ -229,8 +288,8 @@ CacheBreakpoint {
 
 ```protobuf
 GenerationParams {
-  thinking_effort          string?          // one of ThinkingSpec.effort_levels; THINKING_MODE_DISCRETE_EFFORT only
-  thinking_budget_tokens    int64?           // within ThinkingSpec.budget_range; THINKING_MODE_CONTINUOUS_BUDGET only
+  thinking_effort          string?          // one of ThinkingSpec.effort.levels; requires effort to be present
+  thinking_budget_tokens    int64?           // within ThinkingSpec.budget.range; requires budget to be present
   max_output_tokens         int64?           // per-request override of ModelSpec.max_output_tokens
   temperature                double?          // sampling temperature; vendor-specific range/semantics, passed through as-is
   stop_sequences            []string          // sequences that MUST stop generation before they're produced

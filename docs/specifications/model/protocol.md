@@ -4,7 +4,19 @@ The six RPCs a model provider plugin exposes. See [`README.md`](README.md#transp
 
 ## `GetCapabilities`
 
-Returns a `Capabilities` value with one `ModelSpec` per model the plugin can serve. This MUST be re-queryable cheaply (the kernel may call it often — e.g. before every routing decision) and MUST NOT require network calls to the vendor if avoidable; a plugin SHOULD ship its model list built in and refresh it lazily/periodically rather than blocking on a live API call per invocation.
+Returns a `Capabilities` value with one `ModelSpec` per model the plugin can serve. This MUST be re-queryable cheaply — the kernel may call it often, e.g. before every routing decision — and **an individual `GetCapabilities` call MUST NOT make a network call to the vendor**. A plugin serving a fixed roster SHOULD ship its model list built in.
+
+### Gateway and locally-served providers
+
+The rule above is about *per-invocation cost*, not about where the roster originates. A provider fronting a gateway or a local runtime cannot ship a meaningful built-in list — an aggregator's roster is genuinely dynamic and spans many upstream vendors with differing capabilities, and a locally-served runtime's roster is whatever the operator has pulled onto that machine. Such a provider satisfies this RPC by **resolving its roster once, out of band, and serving the resolved result from memory**:
+
+- Resolve during `Configure`, which is called once at bring-up, is already permitted to do real work, and is already the place a bad configuration MUST fail. A roster fetch that fails there is a configuration failure with a clear cause, not a routing decision that mysteriously finds no models.
+- Serve every `GetCapabilities` call from the in-process cache. The call stays cheap and non-blocking, which is the guarantee the requirement exists to protect.
+- A provider MAY refresh that cache in the background on its own schedule. It MUST NOT make `GetCapabilities` block on the refresh; a stale roster served instantly is strictly better than a fresh one that stalls every routing decision.
+
+A provider whose upstream roster genuinely cannot be resolved at `Configure` time SHOULD serve a conservative built-in subset rather than an empty list, because an empty `Capabilities` is indistinguishable from "this provider serves nothing" and makes the plugin unroutable.
+
+**Credentials are not universally required.** A provider MUST NOT declare an API-key attribute `required` unless every deployment it supports needs one. A locally-served runtime reached over loopback typically has no authentication at all, and the same plugin pointed at that vendor's hosted tier does. Such a provider declares the credential optional and validates the actual combination in `Configure` — where a missing key for a remote endpoint is a clear, immediate configuration error — rather than making an unauthenticated local deployment impossible to configure.
 
 The response MAY additionally include `slash_commands: []common.v1.PromptExpansionSpec` (declared once for the provider as a whole, not per model) and MUST include the provider's `ConfigSchema`, so the kernel knows what fields `Configure` expects before ever calling it. Each `PromptExpansionSpec` is a static template-expansion command only — the kernel expands `template` with the user's arguments and submits the result as an ordinary user message, never executing anything. A direct-invoke command that runs one of this provider's own operations is declared by a `slashcommand.v1` provider instead ([`../slashcommand/protocol.md`](../slashcommand/protocol.md)), never here. See [`data-types.md`](data-types.md#modelspec) for the full `ModelSpec` shape.
 
@@ -13,8 +25,16 @@ The response also carries `supported_hook_points: []common.v1.HookPoint` ([`data
 ### `CountTokens`
 
 ```text
-CountTokens(text: string, model_id: string) -> { count: int }
+CountTokens(CountTokensRequest{
+  model_id, messages, assembled_context, tools
+}) -> { count: int }
 ```
+
+`CountTokens` counts **a request**, not a string. Its request mirrors [`StreamCompletionRequest`](data-types.md#streamcompletionrequest)'s content-bearing fields — `messages`, `assembled_context`, and `tools` — minus everything that only affects generation (`params`, `cache_breakpoints`, `call_context`).
+
+This shape is what the question actually requires. Every vendor that exposes exact counting counts a whole request: Anthropic's `/v1/messages/count_tokens` takes `messages` plus `system` plus `tools` and returns the input-token total for that request. A flat string cannot express the question "how many tokens is this conversation", and answering it by concatenating text and discarding the rest undercounts by the entire tool-schema and system-preamble weight — which is precisely the weight that decides whether a turn fits in the context window. A caller with only loose content to measure (a context provider sizing its own contribution via [`kernel-callbacks.md#counttokens`](../kernel-callbacks.md#counttokens)) passes it as a single user message; that is what the adapter would have had to construct anyway.
+
+Every field except `model_id` MAY be empty, and an empty request MUST count as whatever that vendor charges for an empty request — usually not zero, since most vendors bill some fixed request overhead.
 
 `model_id` MUST be set on every `CountTokensRequest` — it selects which of this provider's `ModelSpec.id` to count against, since a provider serving several models MAY use a distinct tokenizer per model.
 
@@ -25,6 +45,9 @@ SHOULD be implemented per model, using that vendor's real tokenizer: rather than
 Accepts a config object decoded from the provider's `agent.hcl` block via the schema-to-cty bridge (see [`configuration/blocks-reference.md`](../configuration/blocks-reference.md)). Field contents are provider-specific (API key, base URL override, org/project IDs, etc.) — this protocol doesn't mandate a shape beyond:
 
 - `Configure` MUST reject with a clear, structured error on missing required fields (e.g. no API key) rather than deferring the failure to the first `StreamCompletion` call.
+- **`Configure` MUST be safely re-callable.** A plugin MUST accept it more than once over its lifetime and MUST replace its configured state wholesale rather than merging into it: a second call carries the operator's complete intent, so a field absent from it is absent, not inherited from the first. A provider holding a vendor client rebuilds that client here for the same reason — a client built from one configuration and a setting from another is a silently inconsistent provider, and the inconsistency surfaces as vendor errors that look like anything but a config problem.
+
+  The kernel does not re-invoke `Configure` on a running plugin today; it is called once at bring-up. The requirement is stated now because it is the difference between a credential rotation or endpoint change costing a process restart and costing nothing, and because a plugin written against the weaker "called exactly once" reading would have to be reworked rather than merely re-invoked once that path exists. A provider is conformant only if a second `Configure` leaves it working.
 - A plugin MUST NOT echo any received secret value into an `Emit`'d event, a `Render` output, a log line, or an error message. Secrets flow into the process once, at `Configure` time, and stay there.
 - Resolving `env(...)`-style indirection in `agent.hcl` is the kernel's job (part of the HCL/`cty` bridge), not the plugin's — by the time `Configure` is called, the plugin receives resolved literal values regardless of how the operator wrote them in HCL. The `env(name)` argument MUST be a literal string, syntax-validated before evaluation (whether the named variable is actually set is a separate, evaluation-time check).
 
@@ -46,7 +69,12 @@ A plugin whose backend does not natively stream (batch-only) MUST still implemen
 
 ### Generation-parameter validation and capability-aware routing
 
-`GenerationParams.thinking_effort`/`thinking_budget_tokens` MUST be validated against the resolved model's declared [`ThinkingSpec`](data-types.md#thinkingspec) before the request is dispatched to the plugin — an effort level outside `ThinkingSpec.effort_levels`, or a budget outside `ThinkingSpec.budget_range`, is a kernel-level reject-or-fallback, not something sent to the vendor and left to surface as a raw API error three layers up the stack. A caller (the turn loop, a sub-agent spawn) that needs a parameter the resolved model doesn't support MUST either drop back to that model's default behavior or fail the selection, never forward an invalid combination.
+`GenerationParams.thinking_effort`/`thinking_budget_tokens` MUST be validated against the resolved model's declared [`ThinkingSpec`](data-types.md#thinkingspec) before the request is dispatched to the plugin — each against the specific control that governs it, since the two are independent axes and a model MAY declare either, both, or neither:
+
+- `thinking_effort` requires `ThinkingSpec.effort` to be present, and MUST be one of its `levels`.
+- `thinking_budget_tokens` requires `ThinkingSpec.budget` to be present, and MUST fall inside its `range`.
+
+A parameter naming a control the resolved model does not declare, or a value outside that control's declared domain, is a kernel-level reject-or-fallback — not something sent to the vendor and left to surface as a raw API error three layers up the stack. A caller (the turn loop, a sub-agent spawn) that needs a parameter the resolved model doesn't support MUST either drop back to that model's default behavior or fail the selection, never forward an invalid combination. Sending both parameters to a model declaring both controls is legal; how the vendor reconciles them is that adapter's concern.
 
 `GenerationParams.tool_choice.mode` follows the identical rule against `ModelSpec.supported_tool_choice_modes`: a mode the resolved model doesn't declare support for MUST NOT be forwarded to the vendor — reject or fall back to `TOOL_CHOICE_MODE_AUTO` (equivalent to omitting `tool_choice`) at the kernel level, same as an out-of-range thinking param. See [`data-types.md#generationparams`](data-types.md#generationparams).
 

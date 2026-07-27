@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -27,15 +28,17 @@ func fullSpec() model.Spec {
 		SupportsVision:    true,
 		SupportsDocuments: true,
 		Thinking: model.ThinkingSpec{
-			Supported:    true,
-			Mode:         modelv1.ThinkingMode_THINKING_MODE_DISCRETE_EFFORT,
-			EffortLevels: []string{"low", "medium", "high"},
-			CanDisable:   false,
-			Default:      "medium",
+			Supported: true,
+			Effort: &model.EffortControl{
+				Levels:  []string{"low", "medium", "high"},
+				Default: "medium",
+			},
+			AdaptiveByDefault: true,
+			Disable:           modelv1.ThinkingDisableSupport_THINKING_DISABLE_SUPPORT_NEVER,
 		},
 		Caching: model.CachingSpec{
-			Supported: true,
-			Mode:      modelv1.CachingMode_CACHING_MODE_EXPLICIT_MARKERS,
+			Supported:       true,
+			ExplicitMarkers: true,
 		},
 	}
 }
@@ -44,18 +47,22 @@ func fullSpec() model.Spec {
 // discrete effort, used to exercise the budget-token path and the
 // temperature-inclusion rule (only the effort ladder rejects temperature).
 func budgetSpec(canDisable bool) model.Spec {
+	disable := modelv1.ThinkingDisableSupport_THINKING_DISABLE_SUPPORT_NEVER
+	if canDisable {
+		disable = modelv1.ThinkingDisableSupport_THINKING_DISABLE_SUPPORT_ALWAYS
+	}
 	return model.Spec{
 		ID:              "claude-legacy",
 		MaxOutputTokens: 4096,
 		SupportsToolUse: true,
 		Thinking: model.ThinkingSpec{
-			Supported:   true,
-			Mode:        modelv1.ThinkingMode_THINKING_MODE_CONTINUOUS_BUDGET,
-			BudgetRange: &model.ThinkingBudgetRange{Min: 1024, Max: 32000},
-			CanDisable:  canDisable,
-			Default:     "4096",
+			Supported: true,
+			Budget: &model.BudgetControl{
+				Range: model.ThinkingBudgetRange{Min: 1024, Max: 32000},
+			},
+			Disable: disable,
 		},
-		Caching: model.CachingSpec{Mode: modelv1.CachingMode_CACHING_MODE_NONE},
+		Caching: model.CachingSpec{},
 	}
 }
 
@@ -66,8 +73,8 @@ func minimalSpec() model.Spec {
 	return model.Spec{
 		ID:              "claude-minimal",
 		MaxOutputTokens: 2048,
-		Thinking:        model.ThinkingSpec{Mode: modelv1.ThinkingMode_THINKING_MODE_NONE},
-		Caching:         model.CachingSpec{Mode: modelv1.CachingMode_CACHING_MODE_NONE},
+		Thinking:        model.ThinkingSpec{},
+		Caching:         model.CachingSpec{},
 	}
 }
 
@@ -879,4 +886,65 @@ func TestCoalesceMessages(t *testing.T) {
 			t.Fatalf("got %#v, want %#v", got, want)
 		}
 	})
+}
+
+// TestBuildCountTokensRequest_carriesToolsAndSystem is the regression
+// guard for what the request-shaped CountTokens RPC exists to fix. The
+// earlier flat-text shape could carry neither tool schemas nor the system
+// preamble, so a count omitted both — and tool schemas are frequently the
+// single largest contributor to a request's input tokens, which is exactly
+// the weight that decides whether a turn fits in the context window.
+func TestBuildCountTokensRequest_carriesToolsAndSystem(t *testing.T) {
+	t.Parallel()
+
+	in := &modelv1.CountTokensRequest{
+		ModelId:  "claude-opus-5",
+		Messages: []*contentv1.Message{{Role: contentv1.Role_ROLE_USER, Content: []*contentv1.ContentBlock{content.Text("what changed?")}}},
+		AssembledContext: []*contentv1.ContextSection{{
+			Provider: "project-context",
+			Label:    "CLAUDE.md",
+			Content:  []*contentv1.ContentBlock{content.Text("house rules")},
+		}},
+		Tools: []*modelv1.ToolDeclaration{{
+			Name:        "read",
+			Description: "read a file",
+		}},
+	}
+
+	got, err := BuildCountTokensRequest(in, fullSpec())
+	if err != nil {
+		t.Fatalf("BuildCountTokensRequest: %v", err)
+	}
+
+	if got.Model != "claude-opus-5" {
+		t.Errorf("Model = %q, want claude-opus-5", got.Model)
+	}
+	if len(got.Messages) != 1 {
+		t.Fatalf("len(Messages) = %d, want 1", len(got.Messages))
+	}
+	if len(got.Tools) != 1 || got.Tools[0].Name != "read" {
+		t.Errorf("Tools = %+v, want the declared read tool", got.Tools)
+	}
+	if len(got.System) != 1 || !strings.Contains(got.System[0].Text, "house rules") {
+		t.Errorf("System = %+v, want the assembled context section", got.System)
+	}
+}
+
+// TestBuildCountTokensRequest_emptyRequestIsValid proves an empty request
+// is a legal thing to count: most vendors bill some fixed request
+// overhead, so the answer is not necessarily zero and the adapter must not
+// short-circuit it.
+func TestBuildCountTokensRequest_emptyRequestIsValid(t *testing.T) {
+	t.Parallel()
+
+	got, err := BuildCountTokensRequest(&modelv1.CountTokensRequest{ModelId: "claude-opus-5"}, fullSpec())
+	if err != nil {
+		t.Fatalf("BuildCountTokensRequest: %v", err)
+	}
+	if got.Model != "claude-opus-5" {
+		t.Errorf("Model = %q, want claude-opus-5", got.Model)
+	}
+	if len(got.Messages) != 0 || len(got.Tools) != 0 || len(got.System) != 0 {
+		t.Errorf("got %+v, want an empty body apart from the model", got)
+	}
 }

@@ -105,11 +105,19 @@ func BuildRequest(in *modelv1.StreamCompletionRequest, spec model.Spec) (*Reques
 		return nil, err
 	}
 
-	// Models on the discrete-effort thinking ladder reject temperature
-	// outright (a 400 from the vendor); models on continuous-budget
-	// thinking (or with no thinking capability at all) still accept it.
+	// Models on the effort ladder reject temperature outright (a 400 from
+	// the vendor); models on a token budget, or with no thinking capability
+	// at all, still accept it.
+	//
+	// Presence of an EffortControl is a proxy for "rejects sampling
+	// params", not a statement about thinking as such — the protocol has no
+	// field for the latter, which
+	// docs/specifications/model/conformance.md's open questions records.
+	// The proxy holds for every Anthropic model in this roster and will
+	// need revisiting for the first model that has an effort ladder and
+	// still accepts temperature.
 	var temperature *float64
-	if params != nil && params.Temperature != nil && spec.Thinking.Mode != modelv1.ThinkingMode_THINKING_MODE_DISCRETE_EFFORT {
+	if params != nil && params.Temperature != nil && spec.Thinking.Effort == nil {
 		t := *params.Temperature
 		temperature = &t
 	}
@@ -126,6 +134,55 @@ func BuildRequest(in *modelv1.StreamCompletionRequest, spec model.Spec) (*Reques
 		Temperature:   temperature,
 		Thinking:      thinking,
 		OutputConfig:  outputConfig,
+	}, nil
+}
+
+// CountTokensRequest is the POST /v1/messages/count_tokens body.
+//
+// It is deliberately a narrower struct than Request rather than a reuse of
+// it: the endpoint accepts only the fields that affect the input-token
+// total, and sending generation params it does not expect risks a 400 for
+// no benefit.
+type CountTokensRequest struct {
+	Model    string      `json:"model"`
+	Messages []Message   `json:"messages"`
+	System   []TextBlock `json:"system,omitempty"`
+	Tools    []Tool      `json:"tools,omitempty"`
+}
+
+// BuildCountTokensRequest translates in into the Anthropic count-tokens
+// body for the model described by spec.
+//
+// It runs the same buildSystem/buildTools/translateMessage path
+// BuildRequest does, so a count is computed over exactly the content a
+// completion would have carried. Any divergence between the two would
+// make the count silently unrepresentative of the request it is meant to
+// size.
+func BuildCountTokensRequest(in *modelv1.CountTokensRequest, spec model.Spec) (*CountTokensRequest, error) {
+	system, err := buildSystem(in.GetAssembledContext())
+	if err != nil {
+		return nil, err
+	}
+
+	tools, err := buildTools(in.GetTools())
+	if err != nil {
+		return nil, err
+	}
+
+	messages := make([]Message, len(in.GetMessages()))
+	for i, m := range in.GetMessages() {
+		msg, err := translateMessage(m, spec)
+		if err != nil {
+			return nil, err
+		}
+		messages[i] = msg
+	}
+
+	return &CountTokensRequest{
+		Model:    in.GetModelId(),
+		Messages: coalesceMessages(messages),
+		System:   system,
+		Tools:    tools,
 	}, nil
 }
 
@@ -203,35 +260,49 @@ func buildToolChoice(params *modelv1.GenerationParams) (*ToolChoice, error) {
 }
 
 // buildThinking translates params' thinking-control fields into Anthropic's
-// Thinking/OutputConfig pair, driven by spec's declared ThinkingSpec.Mode.
+// Thinking/OutputConfig pair, against whichever controls spec declares.
+//
+// The effort and budget controls are independent axes
+// (docs/specifications/model/data-types.md#thinkingspec), so this checks
+// each requested param against the control that governs it rather than
+// switching on one mode. Effort is checked first: no Anthropic model
+// currently declares both, but if one ever does, sending the effort ladder
+// alongside adaptive thinking is the shape Anthropic documents, and a
+// budget would then be the deprecated path.
+//
+// Note that an effort request yields BOTH thinking:{type:"adaptive"} and
+// output_config.effort — Anthropic's effort ladder rides on top of
+// adaptive reasoning rather than replacing it, which is exactly the fact
+// the old single-mode ThinkingSpec could not declare.
 func buildThinking(params *modelv1.GenerationParams, spec model.Spec) (*Thinking, *OutputConfig, error) {
-	switch spec.Thinking.Mode {
-	case modelv1.ThinkingMode_THINKING_MODE_DISCRETE_EFFORT:
-		if params == nil || params.ThinkingEffort == nil {
-			return nil, nil, nil
-		}
-		level := *params.ThinkingEffort
-		if !slices.Contains(spec.Thinking.EffortLevels, level) {
-			return nil, nil, newInvalidRequestError("thinking effort %q is not one of model %q's effort levels %v", level, spec.ID, spec.Thinking.EffortLevels)
-		}
-		return &Thinking{Type: thinkingTypeAdaptive}, &OutputConfig{Effort: level}, nil
-
-	case modelv1.ThinkingMode_THINKING_MODE_CONTINUOUS_BUDGET:
-		if params == nil || params.ThinkingBudgetTokens == nil {
-			return nil, nil, nil
-		}
-		budget := *params.ThinkingBudgetTokens
-		if budget == 0 && spec.Thinking.CanDisable {
-			return &Thinking{Type: thinkingTypeDisabled}, nil, nil
-		}
-		if spec.Thinking.BudgetRange == nil || budget < spec.Thinking.BudgetRange.Min || budget > spec.Thinking.BudgetRange.Max {
-			return nil, nil, newInvalidRequestError("thinking budget %d is outside model %q's budget range", budget, spec.ID)
-		}
-		return &Thinking{Type: thinkingTypeEnabled, BudgetTokens: &budget}, nil, nil
-
-	default:
+	if params == nil {
 		return nil, nil, nil
 	}
+
+	if effort := spec.Thinking.Effort; effort != nil && params.ThinkingEffort != nil {
+		level := *params.ThinkingEffort
+		if !slices.Contains(effort.Levels, level) {
+			return nil, nil, newInvalidRequestError("thinking effort %q is not one of model %q's effort levels %v", level, spec.ID, effort.Levels)
+		}
+		return &Thinking{Type: thinkingTypeAdaptive}, &OutputConfig{Effort: level}, nil
+	}
+
+	if budget := spec.Thinking.Budget; budget != nil && params.ThinkingBudgetTokens != nil {
+		want := *params.ThinkingBudgetTokens
+		// A budget of zero is how a caller asks for no reasoning at all,
+		// which Anthropic expresses as an explicit disable rather than as a
+		// zero budget — and which is only legal where the model actually
+		// permits disabling.
+		if want == 0 && spec.Thinking.Disable != modelv1.ThinkingDisableSupport_THINKING_DISABLE_SUPPORT_NEVER {
+			return &Thinking{Type: thinkingTypeDisabled}, nil, nil
+		}
+		if want < budget.Range.Min || want > budget.Range.Max {
+			return nil, nil, newInvalidRequestError("thinking budget %d is outside model %q's budget range", want, spec.ID)
+		}
+		return &Thinking{Type: thinkingTypeEnabled, BudgetTokens: &want}, nil, nil
+	}
+
+	return nil, nil, nil
 }
 
 // applyCacheBreakpoints translates the kernel's cache breakpoints into
@@ -245,7 +316,7 @@ func buildThinking(params *modelv1.GenerationParams, spec model.Spec) (*Thinking
 // breakpoints beforehand is what keeps a breakpoint's placement correct
 // regardless of how the messages are later merged.
 func applyCacheBreakpoints(breakpoints []*modelv1.CacheBreakpoint, spec model.Spec, system []TextBlock, tools []Tool, origMessages []Message) error {
-	if spec.Caching.Mode != modelv1.CachingMode_CACHING_MODE_EXPLICIT_MARKERS {
+	if !spec.Caching.ExplicitMarkers {
 		// MUST ignore per StreamCompletionRequest.cache_breakpoints: this
 		// field is meaningful only under explicit-marker caching, and
 		// placement is a kernel decision this adapter only executes.

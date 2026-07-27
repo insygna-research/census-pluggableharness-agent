@@ -150,13 +150,24 @@ func (c *Client) Stream(ctx context.Context, req *Request, sink EventSink) error
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	c.logger.DebugContext(ctx, "anthropic: stream: response", "status", resp.StatusCode)
+	requestID := providerRequestID(resp.Header)
+	c.logger.DebugContext(ctx, "anthropic: stream: response", "status", resp.StatusCode, "provider_request_id", requestID)
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
 		modelErr := classifyHTTP(resp.StatusCode, respBody, resp.Header.Get("retry-after"))
 		c.logRetryable(ctx, "stream", modelErr)
 		return modelErr
+	}
+
+	// Emitted before any content so a stream that fails midway is still
+	// correlatable to the vendor's own logs — the whole reason stream_start
+	// is an early event rather than a field on stop
+	// (model/data-types.md#stream_start-and-vendor-request-correlation).
+	if requestID != "" {
+		if err := sink.StreamStart(requestID); err != nil {
+			return err
+		}
 	}
 
 	return c.drive(ctx, resp.Body, sink)
@@ -199,22 +210,44 @@ func (c *Client) drive(ctx context.Context, body io.Reader, sink EventSink) erro
 	return sink.Error(truncated)
 }
 
-// CountTokens returns an exact count for text against modelID via
+// providerRequestID extracts the vendor's request identifier from a
+// response's headers, or "" when the vendor published none.
+//
+// Two header names are tried because Anthropic has used both spellings
+// across its API surface, and this is best-effort by design: the spec
+// permits omitting stream_start entirely, so a header name that stops
+// matching costs a correlation id, never a failed request. That is why
+// this reads headers rather than parsing the response body — a missing
+// header must be a non-event.
+func providerRequestID(h http.Header) string {
+	for _, name := range []string{"request-id", "x-request-id"} {
+		if v := h.Get(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// CountTokens returns an exact input-token count for req against
 // POST /v1/messages/count_tokens.
-func (c *Client) CountTokens(ctx context.Context, text, modelID string) (int64, error) {
+//
+// The endpoint takes the same messages/system/tools triple the completion
+// endpoint does, so this translates req through the same builders
+// BuildRequest uses rather than flattening it to a string — tool schemas
+// in particular are frequently the largest single contributor to a
+// request's input tokens, and dropping them was the main way the earlier
+// text-only shape produced a badly wrong number.
+func (c *Client) CountTokens(ctx context.Context, req *modelv1.CountTokensRequest, spec model.Spec) (int64, error) {
 	// Same pre-flight cancellation check as Stream, for the same reason.
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	reqBody := struct {
-		Model    string    `json:"model"`
-		Messages []Message `json:"messages"`
-	}{
-		Model:    modelID,
-		Messages: []Message{{Role: roleUser, Content: []Block{{Type: blockText, Text: text}}}},
+	countReq, err := BuildCountTokensRequest(req, spec)
+	if err != nil {
+		return 0, err
 	}
-	body, err := json.Marshal(reqBody)
+	body, err := json.Marshal(countReq)
 	if err != nil {
 		return 0, fmt.Errorf("anthropic: count tokens: encode request: %w", err)
 	}
@@ -225,7 +258,8 @@ func (c *Client) CountTokens(ctx context.Context, text, modelID string) (int64, 
 	}
 	c.setHeaders(httpReq)
 
-	c.logger.DebugContext(ctx, "anthropic: count tokens: request", "method", httpReq.Method, "path", countTokensPath, "model", modelID)
+	c.logger.DebugContext(ctx, "anthropic: count tokens: request", "method", httpReq.Method, "path", countTokensPath, "model", countReq.Model,
+		"messages", len(countReq.Messages), "tools", len(countReq.Tools))
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

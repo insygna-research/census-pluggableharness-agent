@@ -61,7 +61,7 @@ func (svc *Service) Register(s *grpc.Server) {
 // from svc.identity — no Provider method is involved.
 func (svc *Service) Describe(_ context.Context, _ *modelv1.DescribeRequest) (*modelv1.DescribeResponse, error) {
 	return &modelv1.DescribeResponse{
-		Producer: svc.identity.ProducerRef(commonv1.Category_CATEGORY_MODEL),
+		Producer: svc.identity.ProducerRef(commonv1.Category_CATEGORY_MODEL, ProtocolVersion),
 	}, nil
 }
 
@@ -106,7 +106,7 @@ func (svc *Service) CountTokens(ctx context.Context, req *modelv1.CountTokensReq
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "model: CountTokens not implemented by this provider")
 	}
-	count, err := tc.CountTokens(ctx, req.GetText(), req.GetModelId())
+	count, err := tc.CountTokens(ctx, req)
 	if err != nil {
 		return nil, statusFromErr(err)
 	}
