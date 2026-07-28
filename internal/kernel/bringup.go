@@ -9,10 +9,15 @@ import (
 	"os"
 	"time"
 
+	commonv1 "github.com/pluggableharness/agent/pkg/common/proto/v1"
+
 	"github.com/pluggableharness/agent/internal/config"
 	"github.com/pluggableharness/agent/internal/eventbus"
 	"github.com/pluggableharness/agent/internal/hookdispatch"
+	"github.com/pluggableharness/agent/internal/kernelcallback"
 	"github.com/pluggableharness/agent/internal/log"
+	"github.com/pluggableharness/agent/internal/metadata"
+	"github.com/pluggableharness/agent/internal/pending"
 	"github.com/pluggableharness/agent/internal/plugincache"
 	"github.com/pluggableharness/agent/internal/pluginhost"
 	catalogplugin "github.com/pluggableharness/agent/internal/providercatalog/drivers/plugin"
@@ -65,7 +70,49 @@ func bringUp(ctx context.Context, opts Options) (*kernel, error) {
 	if err := k.buildHooks(ctx); err != nil {
 		return k, err
 	}
+	if err := k.startFrontends(ctx); err != nil {
+		return k, err
+	}
 	return k, nil
+}
+
+// isFrontend is the category predicate that splits bring-up into its two
+// Configure passes.
+func isFrontend(c commonv1.Category) bool {
+	return c == commonv1.Category_CATEGORY_FRONTEND
+}
+
+// startFrontends closes the loop bringUp's phasing exists for: build the
+// session runner, install the frontend host behind it, and only then let
+// frontend plugins run their Configure handlers.
+//
+// A frontend calls CreateSession from inside Configure, so every
+// collaborator that call reaches — the catalog, the hook chains, the
+// runner, the host slot — has to be live before this point. Everything
+// above in bringUp is that prerequisite, in dependency order.
+//
+// In -prompt mode the frontend pass is skipped entirely. A frontend's
+// Configure is what makes it seize the terminal and start a session of
+// its own, and a non-interactive run has neither a terminal to give away
+// nor anything for a second session to do. Frontends are still prepared,
+// so they appear in the registry and the catalog exactly as any other
+// provider — only the step with side effects is withheld.
+func (k *kernel) startFrontends(ctx context.Context) error {
+	runner, err := k.newRunner(ctx)
+	if err != nil {
+		return err
+	}
+	k.runner = runner
+	k.hostSlot.Set(newFrontendHost(k, runner, k.plans, k.inter))
+
+	if k.opts.Prompt != "" {
+		k.logger.DebugContext(ctx, "kernel: non-interactive run, frontends left unconfigured")
+		return nil
+	}
+	if err := k.supervisor.Configure(ctx, isFrontend); err != nil {
+		return fmt.Errorf("kernel: start frontends: %w", err)
+	}
+	return nil
 }
 
 // loadConfig parses agent.hcl under a throwaway, fully-disabled telemetry
@@ -199,6 +246,11 @@ func (k *kernel) openStores(ctx context.Context) error {
 	k.sessions = sessionstate.NewTable()
 	k.plugins = pluginhost.NewRegistry()
 	k.tokens = tokencount.NewCounter(k.plugins, k.telem, k.logger)
+	k.metadata = metadata.NewStore()
+	k.deltas = kernelcallback.NewDeltaHub()
+	k.hostSlot = &kernelcallback.HostSlot{}
+	k.plans = pending.NewPlanBridge()
+	k.inter = pending.NewInteractiveBridge()
 
 	k.logger.DebugContext(ctx, "kernel: stores open",
 		"sessions_dir", k.paths.SessionsDir,
@@ -250,6 +302,9 @@ func (k *kernel) startPlugins(ctx context.Context) error {
 		Scopes:                 k.scopes,
 		Sessions:               k.sessions,
 		Tokens:                 k.tokens,
+		Metadata:               k.metadata,
+		Deltas:                 k.deltas,
+		HostSlot:               k.hostSlot,
 		ProviderBodies:         k.cfg.ProviderBodies,
 		ProviderEnv:            k.cfg.ProviderEnv,
 		BusSubscribeQueueBound: k.cfg.Settings.EventBus.SubscribeQueueBound,
@@ -263,7 +318,18 @@ func (k *kernel) startPlugins(ctx context.Context) error {
 	// halfway through it leaves earlier plugins running.
 	k.supervisor = sup
 
-	if err := sup.Start(ctx); err != nil {
+	// Two phases, deliberately. Prepare launches, describes, and
+	// registers every provider — which is what makes each one's real
+	// category known, including a dev override's, whose lock file has
+	// none. Configure then runs for everything except frontends, so the
+	// catalog below is built over configured tool and model plugins
+	// while frontends are still holding at their Configure handler. The
+	// frontend pass runs from startFrontends, once the host they call
+	// back into exists.
+	if err := sup.Prepare(ctx); err != nil {
+		return fmt.Errorf("kernel: start plugins: %w", err)
+	}
+	if err := sup.Configure(ctx, func(c commonv1.Category) bool { return !isFrontend(c) }); err != nil {
 		return fmt.Errorf("kernel: start plugins: %w", err)
 	}
 

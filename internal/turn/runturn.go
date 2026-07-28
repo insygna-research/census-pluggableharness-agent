@@ -166,6 +166,7 @@ func (r *run) execute(ctx context.Context) (Result, error) {
 		Usage:           resp.Usage,
 		CostUSD:         resp.CostUSD,
 		AssembledTokens: assembled.AssembledTokensLastTurn,
+		ActualModel:     resp.ActualModel,
 	}
 
 	// Step 6 — the implicit DoneCheck. No tool_use blocks ends the turn
@@ -372,6 +373,7 @@ func (r *run) callContext() *commonv1.CallContext {
 func (r *run) callModel(ctx context.Context, mreq *modelv1.StreamCompletionRequest) (modelcall.Response, error) {
 	resp, err := r.d.model.Complete(ctx, modelcall.Request{
 		Model:     r.req.Model,
+		SessionID: r.req.SessionID,
 		MessageID: r.d.ids.New(),
 		Request:   mreq,
 	})

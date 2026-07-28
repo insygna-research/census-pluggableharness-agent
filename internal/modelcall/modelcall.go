@@ -67,6 +67,11 @@ type Config struct {
 	Telemetry *telemetry.Provider
 	// Logger is this Caller's structured logger.
 	Logger *slog.Logger
+	// OnTextDelta is called for every text_delta StreamEvent after it is
+	// successfully Observed, for the live token fast path. MAY be nil.
+	// targetID is the completion's MessageID so frontends can correlate
+	// consecutive deltas into one growing block.
+	OnTextDelta func(sessionID, targetID, text string)
 }
 
 // Request is one StreamCompletion invocation: which model to call, the
@@ -81,6 +86,10 @@ type Request struct {
 	// Model is the resolved model handle to call — its Client is what
 	// Complete invokes StreamCompletion on.
 	Model providercatalog.ModelHandle
+	// SessionID is the session this completion belongs to — used only for
+	// OnTextDelta attribution on the live token fast path. MAY be empty
+	// when no delta fan-out is configured.
+	SessionID string
 	// MessageID is the kernel-assigned id for the message this call will
 	// produce, used as both contentv1.Message.Id and the persisted
 	// statebackend.Event.ID.
@@ -106,6 +115,15 @@ type Response struct {
 	// call made, including the one that finally succeeded (1 if the
 	// first attempt succeeded).
 	Attempts int
+	// ActualModel is the model the vendor says actually served this
+	// completion, from a StreamMetadata event, when it differs from the
+	// requested id. Empty when the vendor served what was asked for or
+	// reported nothing.
+	//
+	// Surfaced up to the session so silent model substitution is
+	// attributable: a vendor rerouting for safety or capacity otherwise
+	// shows up only as answers that got worse for no visible reason.
+	ActualModel string
 }
 
 // Error carries a classified, non-retried (or retries-exhausted) model

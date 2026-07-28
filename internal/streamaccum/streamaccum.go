@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	contentv1 "github.com/pluggableharness/agent/pkg/content/proto/v1"
@@ -81,13 +83,41 @@ type Accumulator struct {
 	openKind     blockKind
 	openText     *contentv1.TextBlock
 	openThinking *contentv1.ThinkingBlock
-	pendingSig   []byte
-	tools        map[string]*toolCallState
+	// openThinkingChannel is which reasoning stream the open thinking
+	// block belongs to, so a summary run and a raw-reasoning run stay
+	// separate blocks even when adjacent.
+	openThinkingChannel modelv1.StreamEvent_ThinkingChannel
+	pendingSig          []byte
+	tools               map[string]*toolCallState
 
 	usage      *modelv1.Usage
 	stopReason modelv1.StopReason
 	modelErr   *modelv1.ModelError
 	terminal   bool
+
+	// providerRequestID is the vendor's own identifier for this request,
+	// from a StreamStart event. Empty when the provider published none —
+	// events.proto marks StreamStart as MAY-omit.
+	providerRequestID string
+
+	// correlationIDs are the other handles this request is known by,
+	// from StreamStart. Nil until one arrives.
+	correlationIDs map[string]string
+
+	// metadata is every StreamMetadata event observed so far, merged
+	// field by field in arrival order. Nil until one arrives.
+	//
+	// Merged rather than replaced because events.proto specifies a later
+	// event as superseding an earlier one per field, with an absent field
+	// meaning "no new information" rather than "cleared" — keeping only
+	// the newest event would silently drop an actual_model reported once
+	// at the top of a stream.
+	metadata *modelv1.StreamEvent_StreamMetadata
+
+	// safety are the vendor interventions reported during this stream, in
+	// arrival order. Accumulated rather than replaced: a request can be
+	// buffered and then moderated, and the sequence is the explanation.
+	safety []*modelv1.StreamEvent_SafetyNotice
 }
 
 // New returns a ready Accumulator with no content observed yet.
@@ -113,11 +143,31 @@ func (a *Accumulator) Observe(ev *modelv1.StreamEvent) error {
 	}
 
 	switch e := ev.GetEvent().(type) {
+	case *modelv1.StreamEvent_StreamStart_:
+		// Purely informational, and deliberately not a block boundary:
+		// it carries no content and normally arrives before any, so
+		// closing an open block here would split a run of deltas that a
+		// vendor happened to precede with a late StreamStart.
+		a.observeStreamStart(e.StreamStart)
+		return nil
+	case *modelv1.StreamEvent_SafetyNotice_:
+		// Not a block boundary: it carries no content, and a vendor may
+		// interpose mid-completion, so closing an open block here would
+		// split a text run around a moderation notice.
+		a.safety = append(a.safety, e.SafetyNotice)
+		return nil
+	case *modelv1.StreamEvent_Metadata:
+		// Not a block boundary either, and for a stronger reason:
+		// events.proto explicitly permits this mid-stream, so closing an
+		// open block here would split a text run whenever a vendor
+		// revised its headers partway through a completion.
+		a.observeMetadata(e.Metadata)
+		return nil
 	case *modelv1.StreamEvent_TextDelta_:
 		a.observeTextDelta(e.TextDelta.GetText())
 		return nil
 	case *modelv1.StreamEvent_ThinkingDelta_:
-		a.observeThinkingDelta(e.ThinkingDelta.GetText())
+		a.observeThinkingDelta(e.ThinkingDelta.GetText(), e.ThinkingDelta.GetChannel())
 		return nil
 	case *modelv1.StreamEvent_ThinkingSignature_:
 		return a.observeThinkingSignature(e.ThinkingSignature.GetSignature())
@@ -175,6 +225,109 @@ func (a *Accumulator) Err() *modelv1.ModelError {
 	return a.modelErr
 }
 
+// observeStreamStart records the vendor's handles for this request.
+//
+// A second StreamStart overwrites rather than merges: the event means
+// "the vendor accepted this request and named it", and two different
+// names for one request is a provider bug, not a merge to reconcile.
+func (a *Accumulator) observeStreamStart(ev *modelv1.StreamEvent_StreamStart) {
+	a.providerRequestID = ev.GetProviderRequestId()
+	if ids := ev.GetCorrelationIds(); len(ids) > 0 {
+		a.correlationIDs = maps.Clone(ids)
+	}
+}
+
+// observeMetadata merges one StreamMetadata event into the accumulated
+// view, field by field.
+//
+// Absent means "no new information", never "cleared" — so every field
+// below is copied only when the incoming event actually set it. The
+// repeated and map fields follow the same rule: a non-empty value
+// replaces (rate_limits is a whole snapshot of every budget, so merging
+// entry by entry would resurrect a budget the vendor stopped reporting),
+// while attrs merges by key (it is an open bag of independent facts).
+func (a *Accumulator) observeMetadata(ev *modelv1.StreamEvent_StreamMetadata) {
+	if a.metadata == nil {
+		a.metadata = &modelv1.StreamEvent_StreamMetadata{}
+	}
+	m := a.metadata
+
+	if v := ev.ActualModel; v != nil {
+		m.ActualModel = proto.String(*v)
+	}
+	if v := ev.SystemFingerprint; v != nil {
+		m.SystemFingerprint = proto.String(*v)
+	}
+	if v := ev.ServiceTier; v != nil {
+		m.ServiceTier = proto.String(*v)
+	}
+	if v := ev.LiveContextWindow; v != nil {
+		m.LiveContextWindow = proto.Int64(*v)
+	}
+	if v := ev.LiveMaxOutputTokens; v != nil {
+		m.LiveMaxOutputTokens = proto.Int64(*v)
+	}
+	if v := ev.CatalogEtag; v != nil {
+		m.CatalogEtag = proto.String(*v)
+	}
+	if len(ev.GetRateLimits()) > 0 {
+		m.RateLimits = ev.GetRateLimits()
+	}
+	for k, v := range ev.GetAttrs() {
+		if m.Attrs == nil {
+			m.Attrs = make(map[string]string, len(ev.GetAttrs()))
+		}
+		m.Attrs[k] = v
+	}
+}
+
+// Metadata returns every StreamMetadata event observed so far, merged
+// into one value, or nil if the provider reported none.
+//
+// Readable mid-stream by design: actual_model and the rate-limit
+// snapshots it carries are most useful while a completion is still
+// running, which is the reason the event exists separately from the
+// terminal usage payload.
+//
+// The returned message aliases the accumulator's own state — treat it as
+// read-only, exactly as Result's Message and Usage are.
+func (a *Accumulator) Metadata() *modelv1.StreamEvent_StreamMetadata {
+	return a.metadata
+}
+
+// CorrelationIDs returns the additional vendor handles for this request
+// from StreamStart, or nil if none were reported. The returned map is a
+// copy: a caller stashing it for a support ticket must not be able to
+// mutate what a later Result reports.
+func (a *Accumulator) CorrelationIDs() map[string]string {
+	return maps.Clone(a.correlationIDs)
+}
+
+// SafetyNotices returns the vendor interventions reported during this
+// stream, in arrival order, or nil if there were none.
+//
+// Readable mid-stream deliberately: a BUFFERING notice explains a stall
+// while the stall is still happening, which is the only time the
+// explanation is worth anything.
+//
+// The returned slice aliases the accumulator's own state — read-only,
+// like Result's Message and Usage.
+func (a *Accumulator) SafetyNotices() []*modelv1.StreamEvent_SafetyNotice {
+	return a.safety
+}
+
+// ProviderRequestID returns the vendor's own identifier for this request,
+// as carried by a StreamStart event, or "" if the provider published
+// none. It is opaque: surfaced so a failure can be correlated against the
+// vendor's logs, never parsed.
+//
+// Unlike Result, this is readable mid-stream — the id arrives early
+// precisely so it is available when the stream fails rather than only
+// when it succeeds.
+func (a *Accumulator) ProviderRequestID() string {
+	return a.providerRequestID
+}
+
 // closeOpenBlock finalizes whatever implicit text/thinking block is
 // currently open, per data-types.md#streamevent: a thinking block's
 // signature is "attached... once, at that block's own terminal point,"
@@ -210,13 +363,20 @@ func (a *Accumulator) observeTextDelta(text string) {
 // thinking block, opening a new one first if the previous event wasn't
 // itself a ThinkingDelta (or a ThinkingSignature belonging to the same
 // block) continuing it.
-func (a *Accumulator) observeThinkingDelta(text string) {
-	if a.openKind != blockKindThinking {
+func (a *Accumulator) observeThinkingDelta(text string, channel modelv1.StreamEvent_ThinkingChannel) {
+	// A channel switch closes the open block even though both sides are
+	// thinking. A vendor-written summary and the raw reasoning it
+	// summarizes are different text; concatenating them because they are
+	// adjacent and both "thinking" would produce one block that reads as
+	// neither. Providers that set no channel leave this UNSPECIFIED
+	// throughout, so their runs coalesce exactly as before.
+	if a.openKind != blockKindThinking || a.openThinkingChannel != channel {
 		a.closeOpenBlock()
 		th := &contentv1.ThinkingBlock{}
 		a.blocks = append(a.blocks, &contentv1.ContentBlock{Block: &contentv1.ContentBlock_Thinking{Thinking: th}})
 		a.openThinking = th
 		a.openKind = blockKindThinking
+		a.openThinkingChannel = channel
 	}
 	a.openThinking.Text += text
 }
